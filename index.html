@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local UHC Insights Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    
+    <style>
+        :root {
+            --bg-color: #f3f2f1;
+            --card-bg: #ffffff;
+            --text-main: #333333;
+            --uhc-orange: #d85c27;
+            --uhc-blue: #00529b;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+        .header-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .file-upload {
+            background: var(--card-bg);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 3fr 1fr;
+            gap: 20px;
+        }
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .panel {
+            background: var(--card-bg);
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border: 1px solid #e1dfdd;
+        }
+        .funnel-container {
+            display: flex;
+            justify-content: space-between;
+        }
+        .ratios-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            align-items: flex-end;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        .charts-row {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 15px;
+        }
+        .sidebar {
+            background: var(--card-bg);
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        select {
+            width: 100%;
+            padding: 8px;
+            margin-top: 5px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9em;
+        }
+        th, td {
+            border-bottom: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-bar">
+        <h2>UHC COSMOS INSIGHTS (Local Viewer)</h2>
+        <div class="file-upload">
+            <label for="csvFileInput"><strong>Load Data (Local CSV):</strong></label>
+            <input type="file" id="csvFileInput" accept=".csv">
+            <span id="loadingStatus" style="margin-left:10px; color:var(--uhc-orange);"></span>
+        </div>
+    </div>
+
+    <div class="dashboard-grid">
+        <div class="main-content">
+            <div class="panel">
+                <h3>INFLOW FUNNEL</h3>
+                <div class="funnel-container">
+                    <div id="funnel-metrics">
+                        <p>INFLOW: <strong id="kpi-inflow">--</strong></p>
+                        <p>INSCOPE: <strong id="kpi-inscope">--</strong></p>
+                        <p>SELECTED: <strong id="kpi-selected">--</strong></p>
+                        <p>APPROVED: <strong id="kpi-approved">--</strong></p>
+                    </div>
+                    <div class="ratios-container">
+                        <div style="text-align: right;"><span id="kpi-ratio-cod">--%</span><br><small style="font-weight: normal;">Ratio_cod</small></div>
+                        <div style="text-align: right;"><span id="kpi-ratio-cva">--%</span><br><small style="font-weight: normal;">Ratio_cva</small></div>
+                        <div style="text-align: right;"><span id="kpi-true-auto">--%</span><br><small style="font-weight: normal;">True Auto %</small></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>CODING</h3>
+                <div class="charts-row">
+                    <div id="coding-table-container"></div>
+                    <div><canvas id="codingChart"></canvas></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3>CVA</h3>
+                <div class="charts-row">
+                    <div id="cva-table-container"></div>
+                    <div><canvas id="cvaChart"></canvas></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <h3>FILTERS</h3>
+            <div>
+                <label>Selection Type</label>
+                <select id="filter-selection-type"></select>
+            </div>
+            <div>
+                <label>Month Run</label>
+                <select id="filter-month-run"></select>
+            </div>
+            <div>
+                <label>Client</label>
+                <select id="filter-client"></select>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let globalData = [];
+        let codChartInstance = null;
+        let cvaChartInstance = null;
+
+        document.getElementById('csvFileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            document.getElementById('loadingStatus').innerText = "Loading and parsing data...";
+
+            Papa.parse(file, {
+                header: true,
+                dynamicTyping: true,
+                skipEmptyLines: true,
+                complete: function(results) {
+                    globalData = results.data;
+                    document.getElementById('loadingStatus').innerText = `Loaded ${globalData.length.toLocaleString()} rows.`;
+                    initializeFilters();
+                }
+            });
+        });
+
+        function initializeFilters() {
+            const clients = [...new Set(globalData.map(d => d.client).filter(Boolean))].sort();
+            const selectionTypes = [...new Set(globalData.map(d => d.selection_type).filter(Boolean))].sort();
+            const monthRuns = [...new Set(globalData.map(d => d.month_run).filter(Boolean))].sort((a, b) => b - a);
+
+            populateDropdown('filter-client', clients);
+            populateDropdown('filter-selection-type', selectionTypes);
+            populateDropdown('filter-month-run', monthRuns);
+
+            ['filter-client', 'filter-selection-type', 'filter-month-run'].forEach(id => {
+                document.getElementById(id).addEventListener('change', updateDashboard);
+            });
+
+            if (clients.length > 0) updateDashboard();
+        }
+
+        function populateDropdown(id, options) {
+            const select = document.getElementById(id);
+            select.innerHTML = '';
+            options.forEach(opt => {
+                const el = document.createElement('option');
+                el.value = opt;
+                el.innerText = opt;
+                select.appendChild(el);
+            });
+        }
+
+        function getPrevious6Months(currentMonthStr) {
+            let currentStr = currentMonthStr.toString();
+            let year = parseInt(currentStr.substring(0, 4));
+            let month = parseInt(currentStr.substring(4, 6));
+            let prevMonths = [];
+
+            for (let i = 0; i < 6; i++) {
+                month--;
+                if (month === 0) {
+                    month = 12;
+                    year--;
+                }
+                let mStr = month < 10 ? '0' + month : month;
+                prevMonths.push(parseInt(`${year}${mStr}`));
+            }
+            return prevMonths;
+        }
+
+        function updateDashboard() {
+            const selectedClient = document.getElementById('filter-client').value;
+            const selectedSelType = document.getElementById('filter-selection-type').value;
+            const selectedMonth = parseInt(document.getElementById('filter-month-run').value);
+
+            if (!selectedClient || !selectedSelType || !selectedMonth) return;
+
+            const currentData = globalData.filter(d => 
+                d.client === selectedClient && 
+                d.selection_type === selectedSelType && 
+                d.month_run === selectedMonth
+            );
+
+            const prev6Months = getPrevious6Months(selectedMonth);
+            const historicalData = globalData.filter(d => 
+                d.client === selectedClient && 
+                d.selection_type === selectedSelType && 
+                prev6Months.includes(d.month_run)
+            );
+
+            updateKPIs(currentData, historicalData);
+            updateCategoryPanels(currentData, historicalData, 'COD', 'coding');
+            updateCategoryPanels(currentData, historicalData, 'CVA', 'cva');
+            
+            const trendData = globalData.filter(d => 
+                d.client === selectedClient && 
+                d.selection_type === selectedSelType && 
+                d.month_run <= selectedMonth
+            );
+            updateCharts(trendData, 'COD', 'codingChart');
+            updateCharts(trendData, 'CVA', 'cvaChart');
+        }
+
+        function updateKPIs(curr, hist) {
+            const sum = (data, field) => data.reduce((acc, row) => acc + (row[field] || 0), 0);
+
+            const curInflow = sum(curr, 'inflow');
+            const curInscope = sum(curr, 'inscope');
+            const curSelected = sum(curr, 'selected');
+            const curApproved = sum(curr, 'approved');
+
+            const histInflowAvg = sum(hist, 'inflow') / 6 || 1; 
+            const histInscopeAvg = sum(hist, 'inscope') / 6 || 1;
+            const histSelectedAvg = sum(hist, 'selected') / 6 || 1;
+            const histApprovedAvg = sum(hist, 'approved') / 6 || 1;
+
+            const calcDelta = (cur, avg) => {
+                const diff = ((cur - avg) / avg) * 100;
+                const sign = diff >= 0 ? '▲' : '▼';
+                const color = diff >= 0 ? '#107c10' : '#d13438'; // Power BI style green/red
+                return `<span style="color:${color}; font-size:0.8em; margin-left:10px;">${sign} ${Math.abs(diff).toFixed(2)}%</span>`;
+            };
+
+            document.getElementById('kpi-inflow').innerHTML = `${curInflow.toLocaleString()} ${calcDelta(curInflow, histInflowAvg)}`;
+            document.getElementById('kpi-inscope').innerHTML = `${curInscope.toLocaleString()} ${calcDelta(curInscope, histInscopeAvg)}`;
+            document.getElementById('kpi-selected').innerHTML = `${curSelected.toLocaleString()} ${calcDelta(curSelected, histSelectedAvg)}`;
+            document.getElementById('kpi-approved').innerHTML = `${curApproved.toLocaleString()} ${calcDelta(curApproved, histApprovedAvg)}`;
+
+            const codSelected = sum(curr.filter(d => d.category_insight === 'COD'), 'selected');
+            const cvaSelected = sum(curr.filter(d => d.category_insight === 'CVA'), 'selected');
+            const trueAutoVol = sum(curr.filter(d => ['cod_noreview', 'cva_noreview'].includes(d.function_pre)), 'selected');
+
+            document.getElementById('kpi-ratio-cod').innerText = curSelected > 0 ? `${Math.round((codSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-ratio-cva').innerText = curSelected > 0 ? `${Math.round((cvaSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-true-auto').innerText = curSelected > 0 ? `${Math.round((trueAutoVol / curSelected) * 100)}%` : '0%';
+        }
+
+        function updateCategoryPanels(curr, hist, insightType, prefix) {
+            const curCatData = curr.filter(d => d.category_insight === insightType);
+            const histCatData = hist.filter(d => d.category_insight === insightType);
+            const categories = [...new Set(curCatData.map(d => d.category).filter(Boolean))];
+            
+            let html = `<table><tr><th>CATEGORY</th><th>SELECTED</th><th>APPROVED</th><th>L6hr</th></tr>`;
+            let totalSel = 0, totalApp = 0;
+
+            categories.forEach(cat => {
+                const catCurr = curCatData.filter(d => d.category === cat);
+                const sel = catCurr.reduce((sum, row) => sum + (row.selected || 0), 0);
+                const app = catCurr.reduce((sum, row) => sum + (row.approved || 0), 0);
+                totalSel += sel;
+                totalApp += app;
+
+                const catHist = histCatData.filter(d => d.category === cat);
+                const monthsInHist = [...new Set(catHist.map(d => d.month_run))];
+                
+                let l6hrSum = 0;
+                monthsInHist.forEach(m => {
+                    const monthData = catHist.filter(d => d.month_run === m);
+                    const trueFind = monthData.reduce((sum, row) => sum + (row.true_finding || 0), 0);
+                    const noFind = monthData.reduce((sum, row) => sum + (row.no_finding || 0), 0);
+                    if (trueFind + noFind > 0) {
+                        l6hrSum += (trueFind / (trueFind + noFind));
+                    }
+                });
+                const l6hrAvg = monthsInHist.length > 0 ? (l6hrSum / 6) * 100 : 0; 
+
+                html += `<tr><td>${cat}</td><td>${sel.toLocaleString()}</td><td>${app.toLocaleString()}</td><td>${l6hrAvg.toFixed(0)}%</td></tr>`;
+            });
+
+            html += `<tr style="font-weight:bold; background:#f3f2f1;"><td>Total</td><td>${totalSel.toLocaleString()}</td><td>${totalApp.toLocaleString()}</td><td>--</td></tr></table>`;
+            document.getElementById(`${prefix}-table-container`).innerHTML = html;
+        }
+
+        function updateCharts(trendData, insightType, canvasId) {
+            const catData = trendData.filter(d => d.category_insight === insightType);
+            
+            const grouped = catData.reduce((acc, row) => {
+                if (!acc[row.month_run]) acc[row.month_run] = { sel: 0, app: 0 };
+                acc[row.month_run].sel += (row.selected || 0);
+                acc[row.month_run].app += (row.approved || 0);
+                return acc;
+            }, {});
+
+            const labels = Object.keys(grouped).sort((a, b) => a - b);
+            const selData = labels.map(l => grouped[l].sel);
+            const appData = labels.map(l => grouped[l].app);
+
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            
+            if (insightType === 'COD' && codChartInstance) codChartInstance.destroy();
+            if (insightType === 'CVA' && cvaChartInstance) cvaChartInstance.destroy();
+
+            const newChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'APPROVED',
+                            data: appData,
+                            borderColor: '#00529b',
+                            backgroundColor: '#00529b',
+                            borderWidth: 2,
+                            tension: 0.3
+                        },
+                        {
+                            label: 'SELECTED',
+                            data: selData,
+                            borderColor: '#60a5fa',
+                            backgroundColor: '#60a5fa',
+                            borderWidth: 2,
+                            tension: 0.3
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { legend: { position: 'top' } },
+                    scales: {
+                        y: { beginAtZero: true }
+                    }
+                }
+            });
+
+            if (insightType === 'COD') codChartInstance = newChart;
+            if (insightType === 'CVA') cvaChartInstance = newChart;
+        }
+    </script>
+</body>
+</html>
