@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UHC Insights Static Report</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-body: #f8fafc;
+            --bg-panel: #ffffff;
+            --text-main: #0f172a;
+            --text-muted: #475569;
+            --border-color: #cbd5e1;
+            --uhc-blue: #0284c7;
+            --uhc-orange: #ea580c;
+            --positive: #16a34a;
+            --negative: #dc2626;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            margin: 0;
+            padding: 24px;
+        }
+
+        /* --- UI Elements --- */
+        .header-bar {
+            background: var(--bg-panel);
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header-titles h2 { margin: 0; color: var(--uhc-blue); font-size: 1.5em; }
+        .header-titles p { margin: 4px 0 0 0; color: var(--text-muted); font-size: 0.9em; font-weight: 600; }
+
+        .dashboard-grid { display: grid; grid-template-columns: 3fr 1fr; gap: 24px; }
+
+        .panel {
+            background: var(--bg-panel);
+            padding: 24px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 24px;
+            border: 1px solid var(--border-color);
+        }
+
+        .panel-title {
+            font-size: 1.1em;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 8px;
+            margin-top: 0;
+            margin-bottom: 20px;
+        }
+
+        /* --- KPIs & Funnel --- */
+        .kpi-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .kpi-card {
+            background: #f1f5f9;
+            border-top: 4px solid var(--uhc-blue);
+            padding: 16px;
+            border-radius: 6px;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .kpi-card.orange { border-top-color: var(--uhc-orange); }
+
+        .kpi-title { font-size: 0.8em; color: var(--text-muted); font-weight: 700; margin-bottom: 8px; letter-spacing: 0.5px;}
+        .kpi-value { font-size: 1.8em; font-weight: 700; color: var(--text-main); margin-bottom: 4px;}
+        .kpi-delta { font-size: 0.8em; font-weight: 600; }
+        
+        /* Exclusion Visual */
+        .exclusion-bar-container {
+            margin-bottom: 20px;
+            padding: 12px;
+            background: #f8fafc;
+            border-radius: 6px;
+            border: 1px dashed var(--border-color);
+        }
+        .exclusion-visual {
+            display: flex;
+            height: 12px;
+            border-radius: 6px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .excl-client-fill { background-color: #94a3b8; transition: width 0.3s ease; }
+        .excl-exl-fill { background-color: var(--uhc-orange); transition: width 0.3s ease; }
+
+        .ratios-container {
+            display: flex;
+            justify-content: space-around;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-color);
+        }
+        .ratio-item { text-align: center; font-weight: 600; font-size: 0.9em; }
+        .ratio-item span { display: block; font-size: 1.4em; color: var(--uhc-blue); margin-top: 4px; }
+
+        /* --- Charts & Tables --- */
+        .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        th { text-align: left; padding: 10px 8px; color: var(--text-muted); border-bottom: 2px solid var(--border-color); }
+        td { padding: 10px 8px; border-bottom: 1px solid #e2e8f0; }
+        
+        .heatmap-cell { font-weight: bold; text-align: right; border-radius: 4px; padding-right: 12px !important; }
+        .total-row { font-weight: 700; background: #f1f5f9; border-top: 2px solid var(--border-color); }
+
+        /* --- Sidebar --- */
+        .sidebar {
+            background: var(--bg-panel);
+            padding: 24px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            height: fit-content;
+        }
+        .sidebar label { font-size: 0.85em; font-weight: 700; color: var(--text-muted); }
+        select { width: 100%; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; margin-top: 4px; }
+
+        /* --- PRINT STYLES --- */
+        @media print {
+            body { background: white; padding: 0; margin: 0; }
+            .sidebar, .file-upload { display: none !important; }
+            .dashboard-grid { grid-template-columns: 1fr; gap: 0; }
+            .panel { box-shadow: none; border: none; margin-bottom: 20px; page-break-inside: avoid; padding: 0; }
+            .header-bar { box-shadow: none; border-bottom: 2px solid var(--border-color); padding: 0 0 16px 0; border-radius: 0; }
+            * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-bar">
+        <div class="header-titles">
+            <h2>UHC COSMOS INSIGHTS</h2>
+            <p id="report-subtitle">Please load data to begin</p>
+        </div>
+        <div class="file-upload">
+            <input type="file" id="csvFileInput" accept=".csv">
+        </div>
+    </div>
+
+    <div class="dashboard-grid">
+        <div class="main-content">
+            
+            <div class="panel">
+                <h3 class="panel-title">Inflow & Exclusion Funnel</h3>
+                
+                <div class="kpi-container">
+                    <div class="kpi-card orange">
+                        <div class="kpi-title">INFLOW</div>
+                        <div class="kpi-value" id="kpi-inflow">--</div>
+                        <div class="kpi-delta" id="delta-inflow">--</div>
+                    </div>
+                    <div class="kpi-card orange">
+                        <div class="kpi-title">INSCOPE</div>
+                        <div class="kpi-value" id="kpi-inscope">--</div>
+                        <div class="kpi-delta" id="delta-inscope">--</div>
+                    </div>
+                    <div class="kpi-card">
+                        <div class="kpi-title">SELECTED</div>
+                        <div class="kpi-value" id="kpi-selected">--</div>
+                        <div class="kpi-delta" id="delta-selected">--</div>
+                    </div>
+                    <div class="kpi-card">
+                        <div class="kpi-title">APPROVED</div>
+                        <div class="kpi-value" id="kpi-approved">--</div>
+                        <div class="kpi-delta" id="delta-approved">--</div>
+                    </div>
+                </div>
+
+                <div class="exclusion-bar-container">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85em; font-weight: 600;">
+                        <span>Total Exclusions: <span id="kpi-excl-total">--</span></span>
+                        <span><span style="color: #94a3b8;">Client:</span> <span id="kpi-excl-client">--</span> &nbsp;|&nbsp; <span style="color: var(--uhc-orange);">EXL:</span> <span id="kpi-excl-exl">--</span></span>
+                    </div>
+                    <div class="exclusion-visual">
+                        <div id="bar-client" class="excl-client-fill" style="width: 0%;"></div>
+                        <div id="bar-exl" class="excl-exl-fill" style="width: 0%;"></div>
+                    </div>
+                </div>
+
+                <div class="ratios-container">
+                    <div class="ratio-item">Ratio COD <span id="kpi-ratio-cod">--%</span></div>
+                    <div class="ratio-item">Ratio CVA <span id="kpi-ratio-cva">--%</span></div>
+                    <div class="ratio-item">True Auto % <span id="kpi-true-auto">--%</span></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 class="panel-title">Coding Selections vs Approved</h3>
+                <div class="charts-row">
+                    <div id="coding-table-container"></div>
+                    <div><canvas id="codingChart"></canvas></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 class="panel-title">CVA Selections vs Approved</h3>
+                <div class="charts-row">
+                    <div id="cva-table-container"></div>
+                    <div><canvas id="cvaChart"></canvas></div>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="sidebar">
+            <h3 style="margin:0; font-size:1.1em;">Filters</h3>
+            <div>
+                <label>Client</label>
+                <select id="filter-client"></select>
+            </div>
+            <div>
+                <label>Selection Type</label>
+                <select id="filter-selection-type"></select>
+            </div>
+            <div>
+                <label>Month Run</label>
+                <select id="filter-month-run"></select>
+            </div>
+            <div>
+                <label>Category (Global)</label>
+                <select id="filter-category"><option value="ALL">ALL</option></select>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let globalData = [];
+        let codChartInstance = null;
+        let cvaChartInstance = null;
+
+        document.getElementById('csvFileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            Papa.parse(file, {
+                header: true,
+                dynamicTyping: true,
+                skipEmptyLines: true,
+                complete: function(results) {
+                    globalData = results.data;
+                    initializeFilters();
+                }
+            });
+        });
+
+        function initializeFilters() {
+            const clients = [...new Set(globalData.map(d => d.client).filter(Boolean))].sort();
+            const selectionTypes = [...new Set(globalData.map(d => d.selection_type).filter(Boolean))].sort();
+            const monthRuns = [...new Set(globalData.map(d => d.month_run).filter(Boolean))].sort((a, b) => b - a);
+            const categories = ["ALL", ...new Set(globalData.map(d => d.category).filter(Boolean))].sort();
+
+            populateDropdown('filter-client', clients);
+            populateDropdown('filter-selection-type', selectionTypes);
+            populateDropdown('filter-month-run', monthRuns);
+            populateDropdown('filter-category', categories);
+
+            ['filter-client', 'filter-selection-type', 'filter-month-run', 'filter-category'].forEach(id => {
+                document.getElementById(id).addEventListener('change', updateDashboard);
+            });
+
+            if (clients.length > 0) updateDashboard();
+        }
+
+        function populateDropdown(id, options) {
+            const select = document.getElementById(id);
+            select.innerHTML = '';
+            options.forEach(opt => {
+                const el = document.createElement('option');
+                el.value = opt;
+                el.innerText = opt;
+                select.appendChild(el);
+            });
+        }
+
+        function getPrevious6Months(currentMonthStr) {
+            let currentStr = currentMonthStr.toString();
+            let year = parseInt(currentStr.substring(0, 4));
+            let month = parseInt(currentStr.substring(4, 6));
+            let prevMonths = [];
+
+            for (let i = 0; i < 6; i++) {
+                month--;
+                if (month === 0) { month = 12; year--; }
+                let mStr = month < 10 ? '0' + month : month;
+                prevMonths.push(parseInt(`${year}${mStr}`));
+            }
+            return prevMonths;
+        }
+
+        function updateDashboard() {
+            const client = document.getElementById('filter-client').value;
+            const selType = document.getElementById('filter-selection-type').value;
+            const monthRun = parseInt(document.getElementById('filter-month-run').value);
+            const categoryFilter = document.getElementById('filter-category').value;
+
+            document.getElementById('report-subtitle').innerText = `${client} | ${selType} | Month Run: ${monthRun}`;
+
+            const baseFilter = (d) => d.client === client && d.selection_type === selType && (categoryFilter === "ALL" || d.category === categoryFilter);
+
+            const prev6Months = getPrevious6Months(monthRun);
+            const targetMonths = [...prev6Months, monthRun]; // Exactly 7 months for charting
+
+            const currentData = globalData.filter(d => baseFilter(d) && d.month_run === monthRun);
+            const historicalData = globalData.filter(d => baseFilter(d) && prev6Months.includes(d.month_run));
+            const trendData = globalData.filter(d => baseFilter(d) && targetMonths.includes(d.month_run));
+
+            updateKPIs(currentData, historicalData);
+            updateCategoryPanels(currentData, historicalData, 'COD', 'coding');
+            updateCategoryPanels(currentData, historicalData, 'CVA', 'cva');
+            updateCharts(trendData, 'COD', 'codingChart');
+            updateCharts(trendData, 'CVA', 'cvaChart');
+        }
+
+        function updateKPIs(curr, hist) {
+            const sum = (data, field) => data.reduce((acc, row) => acc + (row[field] || 0), 0);
+
+            // Current Month Volumes
+            const curInflow = sum(curr, 'inflow');
+            const curInscope = sum(curr, 'inscope');
+            const curSelected = sum(curr, 'selected');
+            const curApproved = sum(curr, 'approved');
+
+            // Historical 6-Month Averages
+            const histInflowAvg = sum(hist, 'inflow') / 6 || 1; 
+            const histInscopeAvg = sum(hist, 'inscope') / 6 || 1;
+            const histSelectedAvg = sum(hist, 'selected') / 6 || 1;
+            const histApprovedAvg = sum(hist, 'approved') / 6 || 1;
+
+            // Delta Renderer
+            const renderDelta = (cur, avg, elementId) => {
+                if(cur === 0 && avg === 1) { document.getElementById(elementId).innerHTML = ""; return; }
+                const diff = ((cur - avg) / avg) * 100;
+                const sign = diff >= 0 ? '▲' : '▼';
+                const color = diff >= 0 ? 'var(--positive)' : 'var(--negative)';
+                document.getElementById(elementId).innerHTML = `<span style="color:${color};">${sign} ${Math.abs(diff).toFixed(2)}% vs L6M</span>`;
+            };
+
+            document.getElementById('kpi-inflow').innerText = curInflow.toLocaleString();
+            renderDelta(curInflow, histInflowAvg, 'delta-inflow');
+
+            document.getElementById('kpi-inscope').innerText = curInscope.toLocaleString();
+            renderDelta(curInscope, histInscopeAvg, 'delta-inscope');
+
+            document.getElementById('kpi-selected').innerText = curSelected.toLocaleString();
+            renderDelta(curSelected, histSelectedAvg, 'delta-selected');
+
+            document.getElementById('kpi-approved').innerText = curApproved.toLocaleString();
+            renderDelta(curApproved, histApprovedAvg, 'delta-approved');
+
+            // DIRECT Exclusions pulling from your newly added columns
+            const exlExclusion = sum(curr, 'exl_exclusion');
+            const clientExclusion = sum(curr, 'client_exclusion');
+            const totalExclusion = clientExclusion + exlExclusion;
+
+            document.getElementById('kpi-excl-total').innerText = totalExclusion.toLocaleString();
+            document.getElementById('kpi-excl-client').innerText = clientExclusion.toLocaleString();
+            document.getElementById('kpi-excl-exl').innerText = exlExclusion.toLocaleString();
+
+            if (totalExclusion > 0) {
+                document.getElementById('bar-client').style.width = `${(clientExclusion / totalExclusion) * 100}%`;
+                document.getElementById('bar-exl').style.width = `${(exlExclusion / totalExclusion) * 100}%`;
+            } else {
+                document.getElementById('bar-client').style.width = '0%';
+                document.getElementById('bar-exl').style.width = '0%';
+            }
+
+            // Ratios
+            const codSelected = sum(curr.filter(d => d.category_insight === 'COD'), 'selected');
+            const cvaSelected = sum(curr.filter(d => d.category_insight === 'CVA'), 'selected');
+            
+            // FIXED True Auto logic (case-insensitive and loose matching)
+            const trueAutoVol = sum(curr.filter(d => {
+                if (!d.function_pre) return false;
+                const fp = String(d.function_pre).toLowerCase();
+                return fp.includes('cod_noreview') || fp.includes('cva_noreview');
+            }), 'selected');
+
+            document.getElementById('kpi-ratio-cod').innerText = curSelected > 0 ? `${Math.round((codSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-ratio-cva').innerText = curSelected > 0 ? `${Math.round((cvaSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-true-auto').innerText = curSelected > 0 ? `${Math.round((trueAutoVol / curSelected) * 100)}%` : '0%';
+        }
+
+        function updateCategoryPanels(curr, hist, insightType, prefix) {
+            const curCatData = curr.filter(d => d.category_insight === insightType);
+            const histCatData = hist.filter(d => d.category_insight === insightType);
+            
+            const categories1 = [...new Set(curCatData.map(d => d.category_1).filter(Boolean))].sort();
+            
+            let html = `<table><tr><th>CATEGORY</th><th>SELECTED</th><th>APPROVED</th><th style="text-align:right;">L6HR</th></tr>`;
+            let totalSel = 0, totalApp = 0;
+            let l6hrPercentages = []; // To hold percentages for the Total Average
+
+            categories1.forEach(cat1 => {
+                // Current Month Logic
+                const catCurr = curCatData.filter(d => d.category_1 === cat1);
+                const sel = catCurr.reduce((sum, row) => sum + (row.selected || 0), 0);
+                const app = catCurr.reduce((sum, row) => sum + (row.approved || 0), 0);
+                totalSel += sel;
+                totalApp += app;
+
+                // FIXED L6HR Logic: Aggregate the prior 6 months exclusively
+                const catHist = histCatData.filter(d => d.category_1 === cat1);
+                const trueFindHist = catHist.reduce((sum, row) => sum + (row.true_finding || 0), 0);
+                const noFindHist = catHist.reduce((sum, row) => sum + (row.no_finding || 0), 0);
+                
+                let l6hrAvg = 0;
+                if ((trueFindHist + noFindHist) > 0) {
+                    l6hrAvg = (trueFindHist / (trueFindHist + noFindHist)) * 100;
+                    l6hrPercentages.push(l6hrAvg); // Track valid percentages for total
+                }
+                
+                // Heatmap UI formatting
+                const opacity = Math.min(l6hrAvg / 30, 1) * 0.3; 
+                const heatColor = `rgba(2, 132, 199, ${opacity})`;
+
+                html += `<tr>
+                            <td>${cat1}</td>
+                            <td>${sel.toLocaleString()}</td>
+                            <td>${app.toLocaleString()}</td>
+                            <td class="heatmap-cell" style="background-color: ${heatColor};">${l6hrAvg.toFixed(0)}%</td>
+                         </tr>`;
+            });
+
+            // FIXED Total Row L6HR logic (Average of the above percentages)
+            let totalL6hrAvg = 0;
+            if (l6hrPercentages.length > 0) {
+                totalL6hrAvg = l6hrPercentages.reduce((a, b) => a + b, 0) / l6hrPercentages.length;
+            }
+
+            html += `<tr class="total-row">
+                        <td>Total</td>
+                        <td>${totalSel.toLocaleString()}</td>
+                        <td>${totalApp.toLocaleString()}</td>
+                        <td style="text-align:right;">${totalL6hrAvg.toFixed(0)}%</td>
+                     </tr></table>`;
+                     
+            document.getElementById(`${prefix}-table-container`).innerHTML = html;
+        }
+
+        function updateCharts(trendData, insightType, canvasId) {
+            const catData = trendData.filter(d => d.category_insight === insightType);
+            
+            const grouped = catData.reduce((acc, row) => {
+                if (!acc[row.month_run]) acc[row.month_run] = { sel: 0, app: 0 };
+                acc[row.month_run].sel += (row.selected || 0);
+                acc[row.month_run].app += (row.approved || 0);
+                return acc;
+            }, {});
+
+            // Chart labels will inherently be exactly 7 entries now based on the new trendData filter
+            const labels = Object.keys(grouped).sort((a, b) => a - b);
+            const selData = labels.map(l => grouped[l].sel);
+            const appData = labels.map(l => grouped[l].app);
+
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            if (insightType === 'COD' && codChartInstance) codChartInstance.destroy();
+            if (insightType === 'CVA' && cvaChartInstance) cvaChartInstance.destroy();
+
+            const newChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'APPROVED',
+                            data: appData,
+                            borderColor: '#0284c7',
+                            backgroundColor: '#0284c7',
+                            borderWidth: 2,
+                            pointRadius: 4,
+                            fill: false
+                        },
+                        {
+                            label: 'SELECTED',
+                            data: selData,
+                            borderColor: '#94a3b8',
+                            backgroundColor: '#94a3b8',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            pointRadius: 4,
+                            fill: false
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    animation: false,
+                    plugins: { 
+                        legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8 } } 
+                    },
+                    scales: {
+                        y: { beginAtZero: true, grid: { color: '#f1f5f9' } },
+                        x: { grid: { display: false } }
+                    }
+                }
+            });
+
+            if (insightType === 'COD') codChartInstance = newChart;
+            if (insightType === 'CVA') cvaChartInstance = newChart;
+        }
+    </script>
+</body>
+</html>
