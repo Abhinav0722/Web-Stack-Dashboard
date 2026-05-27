@@ -64,7 +64,7 @@
         .charts-row { display: grid; grid-template-columns: 1fr 1.3fr; gap: 32px; align-items: start; }
         
         .chart-container { display: flex; flex-direction: column; align-items: center; width: 100%; }
-        .chart-wrapper { position: relative; width: 100%; height: 260px; } 
+        .chart-wrapper { position: relative; width: 100%; height: 260px; } /* Screen Height */
         .chart-subtitle { font-size: 0.85em; font-weight: 600; color: var(--text-muted); margin-top: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
         
         table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
@@ -96,36 +96,39 @@
         
         .goal-inputs input { width: 100%; padding: 8px; border: 1px solid var(--border-color); border-radius: 6px; box-sizing: border-box; outline: none;}
 
-        /* STRICT 1-PAGE PORTRAIT PRINT STYLES (Based on 870x1122 Canvas) */
+        /* STRICT 1-PAGE PORTRAIT PRINT STYLES (Targeting Edge 'Actual Size') */
         @media print {
-            @page { size: letter portrait; margin: 5mm; }
-            body { background: white; padding: 0; margin: 0; }
+            @page { size: letter portrait; margin: 0; } /* Remove Browser Margins */
+            body { background: white; padding: 0; margin: 0; zoom: 0.9; } /* Internal zoom makes things bigger to fit page */
             
             .sidebar, .file-upload { display: none !important; }
             .dashboard-grid { grid-template-columns: 1fr; gap: 0; display: block; }
             
-            /* Enforce exact Canvas Width and center it */
+            /* Enforce exact Power BI Canvas Width (870px) and center it on Portrait page */
             .main-content { 
                 width: 870px !important; 
                 max-width: 870px !important; 
                 margin: 0 auto !important; 
-                zoom: 0.85; /* Internal scale to ensure vertical height fits */
             }
             
-            /* Structural Formatting for Print */
+            /* Header Formatting for Print */
             .header-bar { box-shadow: none !important; border: none !important; border-bottom: 2px solid var(--border-color) !important; margin-bottom: 12px !important; padding: 0 0 10px 0 !important; border-radius: 0; justify-content: center; }
             .header-titles h2 { text-align: center; font-size: 1.8em !important; }
             
-            .panel { box-shadow: none !important; border: 1px solid var(--border-color) !important; margin-bottom: 12px !important; padding: 16px 20px !important; page-break-inside: avoid; }
+            /* Panel Formatting for Print - Consistent gaps and outlines */
+            .panel { box-shadow: none !important; border: 1px solid var(--border-color) !important; margin-bottom: 25px !important; padding: 20px !important; page-break-inside: avoid; }
+            .panel:last-child { margin-bottom: 0 !important; }
             .panel-title { margin-bottom: 16px !important; font-size: 1.1em !important; }
             
-            /* Allow charts a little more breathing room since we are in portrait */
-            .chart-wrapper { height: 210px !important; } 
+            /* Fixing overlap: Increase chart box size */
+            .chart-wrapper { height: 260px !important; } /* Plently of room in portrait mode */
+            .chart-subtitle { margin-top: 10px !important; font-size: 0.85em !important; font-weight: 700 !important; }
             
             /* Funnel adjustments for Portrait */
             .funnel-wrapper { gap: 6px !important; margin-bottom: 16px !important; padding: 0 5px !important; }
             .funnel-bar-container { height: 28px !important; }
             
+            /* Metrics split boxes */
             .metrics-row { gap: 12px !important; margin-bottom: 0 !important; }
             .exclusion-box, .ratio-box { padding: 12px !important; }
             .ratio-val { font-size: 1.3em !important; margin-top: 4px !important; }
@@ -580,7 +583,14 @@
                     responsive: true,
                     maintainAspectRatio: false, 
                     animation: false,
-                    layout: { padding: { top: 20, bottom: 20, left: 10, right: 10 } },
+                    layout: { 
+                        padding: { 
+                            top: 20, 
+                            bottom: 35, // FIXED overlap: Increaes padding for native X-axis labels
+                            left: 10, 
+                            right: 10 
+                        } 
+                    },
                     plugins: { 
                         legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8 } },
                         datalabels: {
