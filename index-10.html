@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Selection Insights</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-body: #f3f4f6;
+            --bg-panel: #ffffff;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+            --border-color: #cbd5e1;
+            --uhc-blue: #0284c7;
+            --uhc-light-blue: #38bdf8;
+            --aetna-purple: #702082;
+            --positive: #16a34a;
+            --negative: #dc2626;
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+        }
+
+        body { font-family: 'Inter', system-ui, sans-serif; background-color: var(--bg-body); color: var(--text-main); margin: 0; padding: 24px; }
+
+        /* UI Elements */
+        .header-bar { background: var(--bg-panel); padding: 16px 24px; border-radius: 12px; box-shadow: var(--shadow); margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--border-color); }
+        .header-titles h2 { margin: 0; color: var(--uhc-blue); font-size: 1.6em; transition: color 0.3s ease; letter-spacing: -0.5px; }
+        
+        .dashboard-grid { display: grid; grid-template-columns: 3fr 1fr; gap: 24px; }
+        .panel { background: var(--bg-panel); padding: 24px; border-radius: 12px; box-shadow: var(--shadow); margin-bottom: 24px; border: 1px solid var(--border-color); }
+        
+        /* Dynamic Panel Header styling */
+        .panel-header-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 24px; }
+        .dynamic-title-left, .dynamic-title-right { font-weight: 700; color: var(--text-muted); font-size: 0.9em; text-transform: uppercase; width: 180px; letter-spacing: 0.5px; }
+        .dynamic-title-right { text-align: right; }
+        .panel-title { font-size: 1.1em; color: var(--text-main); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; text-align: center; margin: 0; flex: 1;}
+
+        /* True Center-Aligned Funnel */
+        .funnel-wrapper { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; padding: 0 10px; }
+        .funnel-row { display: flex; align-items: center; width: 100%; gap: 16px; }
+        .funnel-label { width: 100px; font-weight: 700; font-size: 0.85em; color: var(--text-main); text-transform: uppercase; text-align: left; }
+        
+        .funnel-bar-container { flex: 1; display: flex; justify-content: center; align-items: center; background: transparent; height: 32px; position: relative; }
+        .funnel-bar { height: 100%; display: flex; align-items: center; justify-content: center; font-weight: 700; color: white; font-size: 1.05em; border-radius: 4px; transition: width 0.5s ease-out; min-width: 60px; overflow: visible; white-space: nowrap; }
+        
+        .funnel-delta { width: 80px; font-size: 0.85em; font-weight: 700; text-align: right; }
+        
+        /* Bar Gradients */
+        #bar-inflow { background: linear-gradient(90deg, #0284c7, #38bdf8); }
+        #bar-inscope { background: linear-gradient(90deg, #2563eb, #60a5fa); }
+        #bar-selected { background: linear-gradient(90deg, #7c3aed, #a78bfa); }
+        #bar-approved { background: linear-gradient(90deg, #ea580c, #fb923c); }
+
+        /* Ratios & Exclusions (Split Boxes) */
+        .metrics-row { display: flex; gap: 16px; margin-bottom: 10px; }
+        .exclusion-box { flex: 2; background: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); box-shadow: inset 0 2px 4px rgba(0,0,0,0.02); }
+        .ratio-box { flex: 1; background: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); text-align: center; box-shadow: inset 0 2px 4px rgba(0,0,0,0.02); }
+        
+        .ratio-title { font-size: 0.8em; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
+        .ratio-val { display: block; color: var(--uhc-blue); font-size: 1.4em; font-weight: 700; margin-top: 6px; }
+        .exl-highlight { color: var(--uhc-orange); font-weight: 800; }
+
+        /* Charts & Tables */
+        .charts-row { display: grid; grid-template-columns: 1fr 1.3fr; gap: 32px; align-items: start; }
+        
+        .chart-container { display: flex; flex-direction: column; align-items: center; width: 100%; }
+        /* Expanded vertical height to prevent label/subtitle overlap */
+        .chart-wrapper { position: relative; width: 100%; height: 300px; } 
+        .chart-subtitle { font-size: 0.85em; font-weight: 600; color: var(--text-muted); margin-top: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        th { text-align: left; padding: 12px 8px; color: var(--text-muted); border-bottom: 2px solid var(--border-color); font-weight: 600; text-transform: uppercase; }
+        td { padding: 12px 8px; border-bottom: 1px solid #f1f5f9; color: var(--text-main); }
+        .heatmap-cell { font-weight: 700; text-align: right; border-radius: 4px; padding-right: 12px !important; }
+        .total-row { font-weight: 700; background: #f8fafc; border-top: 2px solid var(--border-color); }
+
+        /* Sidebar & Advanced Checkboxes */
+        .sidebar { background: var(--bg-panel); padding: 24px; border-radius: 12px; border: 1px solid var(--border-color); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 20px; height: fit-content; }
+        
+        .master-toggle { display: flex; width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--uhc-blue); }
+        .master-toggle input { display: none; }
+        .master-toggle label { flex: 1; text-align: center; padding: 10px; cursor: pointer; font-weight: 700; color: var(--uhc-blue); background: white; transition: 0.2s; }
+        .master-toggle input:checked + label { background: var(--uhc-blue); color: white; }
+        
+        .filter-group { display: flex; flex-direction: column; gap: 8px; }
+        .filter-group > label { font-size: 0.85em; font-weight: 700; color: var(--text-main); text-transform: uppercase; letter-spacing: 0.5px;}
+        
+        .filter-controls { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+        .filter-search { padding: 6px 8px; border: 1px solid var(--border-color); border-radius: 4px; font-size: 0.85em; outline: none; }
+        .filter-search:focus { border-color: var(--uhc-blue); }
+        .select-all-label { font-size: 0.8em; font-weight: 600; color: var(--text-muted); display: flex; align-items: center; gap: 6px; cursor: pointer; padding-left: 2px; }
+        
+        .checkbox-container { max-height: 140px; overflow-y: auto; background: #f8fafc; padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); font-size: 0.85em; }
+        .checkbox-container::-webkit-scrollbar { width: 6px; }
+        .checkbox-container::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 4px; }
+        .cb-item { font-weight: 500; color: var(--text-main); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+        
+        .goal-inputs input { width: 100%; padding: 8px; border: 1px solid var(--border-color); border-radius: 6px; box-sizing: border-box; outline: none;}
+
+        /* STRICT 1-PAGE PORTRAIT PRINT STYLES (For Edge 'Actual Size') */
+        @media print {
+            @page { size: letter portrait; margin: 0; } 
+            body { background: white; padding: 15px 0; margin: 0; zoom: 0.90; } 
+            
+            .sidebar, .file-upload { display: none !important; }
+            .dashboard-grid { grid-template-columns: 1fr; gap: 0; display: block; }
+            
+            /* Enforce exact Canvas Width and perfectly center it */
+            .main-content { 
+                width: 870px !important; 
+                max-width: 870px !important; 
+                margin: 0 auto !important; 
+            }
+            
+            .header-bar { box-shadow: none !important; border: none !important; border-bottom: 2px solid var(--border-color) !important; margin-bottom: 15px !important; padding: 0 0 10px 0 !important; border-radius: 0; justify-content: center; }
+            .header-titles h2 { text-align: center; font-size: 1.8em !important; }
+            
+            /* Standardized spacing logic to guarantee fit */
+            .panel { box-shadow: none !important; border: 1px solid var(--border-color) !important; margin-bottom: 24px !important; padding: 20px 24px !important; page-break-inside: avoid; }
+            .panel:last-child { margin-bottom: 0 !important; }
+            .panel-header-row { margin-bottom: 12px !important; }
+            .panel-title { font-size: 1.05em !important; }
+            .dynamic-title-left, .dynamic-title-right { font-size: 0.8em !important; }
+            
+            /* Expanded space for native labels without overflowing */
+            .chart-wrapper { height: 250px !important; } 
+            .chart-subtitle { margin-top: 14px !important; font-size: 0.8em !important; font-weight: 700 !important; }
+            
+            .funnel-wrapper { gap: 6px !important; margin-bottom: 16px !important; padding: 0 5px !important; }
+            .funnel-bar-container { height: 26px !important; }
+            
+            .metrics-row { gap: 16px !important; margin-bottom: 0 !important; }
+            .exclusion-box, .ratio-box { padding: 12px !important; }
+            .ratio-val { font-size: 1.3em !important; margin-top: 4px !important; }
+            
+            th, td { padding: 6px 8px !important; font-size: 0.85em !important; }
+            
+            * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-bar">
+        <div class="header-titles">
+            <h2 id="main-title">UHC SELECTION INSIGHTS</h2>
+        </div>
+        <div class="file-upload">
+            <input type="file" id="csvFileInput" accept=".csv" style="font-family: inherit;">
+        </div>
+    </div>
+
+    <div class="dashboard-grid">
+        <div class="main-content">
+            
+            <div class="panel">
+                <div class="panel-header-row">
+                    <div id="dynamic-client" class="dynamic-title-left"></div>
+                    <h3 class="panel-title">INFLOW FUNNEL</h3>
+                    <div id="dynamic-sel" class="dynamic-title-right"></div>
+                </div>
+                
+                <div class="funnel-wrapper">
+                    <div class="funnel-row">
+                        <div class="funnel-label">Inflow</div>
+                        <div class="funnel-bar-container">
+                            <div id="bar-inflow" class="funnel-bar" style="width: 0%"><span id="kpi-inflow">--</span></div>
+                        </div>
+                        <div class="funnel-delta" id="delta-inflow"></div>
+                    </div>
+                    <div class="funnel-row">
+                        <div class="funnel-label">Inscope</div>
+                        <div class="funnel-bar-container">
+                            <div id="bar-inscope" class="funnel-bar" style="width: 0%"><span id="kpi-inscope">--</span></div>
+                        </div>
+                        <div class="funnel-delta" id="delta-inscope"></div>
+                    </div>
+                    <div class="funnel-row">
+                        <div class="funnel-label">Selected</div>
+                        <div class="funnel-bar-container">
+                            <div id="bar-selected" class="funnel-bar" style="width: 0%"><span id="kpi-selected">--</span></div>
+                        </div>
+                        <div class="funnel-delta" id="delta-selected"></div>
+                    </div>
+                    <div class="funnel-row">
+                        <div class="funnel-label">Approved</div>
+                        <div class="funnel-bar-container">
+                            <div id="bar-approved" class="funnel-bar" style="width: 0%"><span id="kpi-approved">--</span></div>
+                        </div>
+                        <div class="funnel-delta" id="delta-approved"></div>
+                    </div>
+                </div>
+
+                <div class="metrics-row">
+                    <div class="exclusion-box">
+                        <strong style="font-size: 1.1em;">Exclusions: <span id="kpi-excl-total">--</span></strong><br>
+                        <span style="color: var(--text-muted); margin-top:8px; display:block;">
+                            Client: <strong id="kpi-excl-client">--</strong> | <span class="exl-highlight">EXL: <span id="kpi-excl-exl">--</span></span>
+                        </span>
+                    </div>
+                    <div class="ratio-box">
+                        <div class="ratio-title">Ratio COD</div>
+                        <span class="ratio-val" id="kpi-ratio-cod">--%</span>
+                    </div>
+                    <div class="ratio-box">
+                        <div class="ratio-title">Ratio CVA</div>
+                        <span class="ratio-val" id="kpi-ratio-cva">--%</span>
+                    </div>
+                    <div class="ratio-box">
+                        <div class="ratio-title">True Auto %</div>
+                        <span class="ratio-val" id="kpi-true-auto">--%</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 class="panel-title" style="text-align: center;">CODING</h3>
+                <div class="charts-row">
+                    <div id="coding-table-container"></div>
+                    <div class="chart-container">
+                        <div class="chart-wrapper"><canvas id="codingChart"></canvas></div>
+                        <div class="chart-subtitle">Selected vs Approved</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h3 class="panel-title" style="text-align: center;">CVA</h3>
+                <div class="charts-row">
+                    <div id="cva-table-container"></div>
+                    <div class="chart-container">
+                        <div class="chart-wrapper"><canvas id="cvaChart"></canvas></div>
+                        <div class="chart-subtitle">Selected vs Approved</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="sidebar">
+            <div class="master-toggle">
+                <input type="radio" id="client-uhc" name="master_client" value="UHC" checked>
+                <label for="client-uhc">UHC</label>
+                <input type="radio" id="client-aetna" name="master_client" value="Aetna">
+                <label for="client-aetna">AETNA</label>
+            </div>
+
+            <div class="filter-group">
+                <label>Month Run</label>
+                <div id="filter-month-run"></div>
+            </div>
+            <div class="filter-group">
+                <label>Client</label>
+                <div id="filter-client"></div>
+            </div>
+            <div class="filter-group">
+                <label>Selection Type</label>
+                <div id="filter-selection-type"></div>
+            </div>
+            <div class="filter-group">
+                <label>COD Band</label>
+                <div id="filter-cod-band"></div>
+            </div>
+            <div class="filter-group">
+                <label>CVA Band</label>
+                <div id="filter-cva-band"></div>
+            </div>
+            
+            <div class="goal-inputs filter-group">
+                <label>Set Chart Goals (For PDF)</label>
+                <input type="number" id="goal-cod" value="5000" placeholder="COD Goal" style="margin-bottom:8px;">
+                <input type="number" id="goal-cva" value="3000" placeholder="CVA Goal">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        Chart.register(window.ChartDataLabels);
+        
+        let globalData = [];
+        let codChartInstance = null;
+        let cvaChartInstance = null;
+
+        // Robust CSV column parser to defeat Databricks alias trailing spaces and formatting
+        function getNum(row, colName) {
+            if (row[colName] !== undefined && typeof row[colName] === 'number') return row[colName];
+            const cleanTarget = colName.toLowerCase().replace(/[^a-z_]/g, '');
+            const key = Object.keys(row).find(k => {
+                const cleanKey = k.toLowerCase().replace(/[^a-z_]/g, '');
+                return cleanKey.includes(cleanTarget);
+            });
+            return key ? Number(row[key]) || 0 : 0;
+        }
+
+        document.getElementById('csvFileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            Papa.parse(file, { header: true, dynamicTyping: true, skipEmptyLines: true, complete: function(results) {
+                globalData = results.data;
+                populateMasterToggles();
+            }});
+        });
+
+        document.querySelectorAll('input[name="master_client"], .goal-inputs input').forEach(el => {
+            el.addEventListener('change', () => {
+                const master = document.querySelector('input[name="master_client"]:checked').value;
+                const title = document.getElementById('main-title');
+                
+                if(master === 'Aetna') {
+                    title.style.color = 'var(--aetna-purple)';
+                    title.innerText = 'AETNA SELECTION INSIGHTS';
+                    document.documentElement.style.setProperty('--uhc-blue', 'var(--aetna-purple)');
+                } else {
+                    title.style.color = '#0284c7';
+                    title.innerText = 'UHC SELECTION INSIGHTS';
+                    document.documentElement.style.setProperty('--uhc-blue', '#0284c7');
+                }
+
+                if (el.name === 'master_client') populateCheckboxesForMaster(master);
+                updateDashboard();
+            });
+        });
+
+        function populateMasterToggles() {
+            const master = document.querySelector('input[name="master_client"]:checked').value;
+            populateCheckboxesForMaster(master);
+            updateDashboard();
+        }
+
+        function populateCheckboxesForMaster(masterClient) {
+            const mData = globalData.filter(d => d.master_client === masterClient);
+            const months = [...new Set(mData.map(d => d.month_run).filter(Boolean))].sort((a,b)=>b-a);
+            const clients = [...new Set(mData.map(d => d.client).filter(Boolean))].sort();
+            const selTypes = [...new Set(mData.map(d => d.selection_type).filter(Boolean))].sort();
+            const codBands = [...new Set(mData.map(d => d.cod_band).filter(Boolean))].sort();
+            const cvaBands = [...new Set(mData.map(d => d.cva_band).filter(Boolean))].sort();
+
+            buildFilterUI('filter-month-run', months);
+            buildFilterUI('filter-client', clients);
+            buildFilterUI('filter-selection-type', selTypes);
+            buildFilterUI('filter-cod-band', codBands);
+            buildFilterUI('filter-cva-band', cvaBands);
+        }
+
+        function buildFilterUI(containerId, values) {
+            const container = document.getElementById(containerId);
+            let listHtml = values.map((v, i) => 
+                `<label class="cb-item"><input type="checkbox" value="${v}" checked onchange="updateDashboard()"> <span>${v}</span></label>`
+            ).join('');
+
+            container.innerHTML = `
+                <div class="filter-controls">
+                    <input type="text" class="filter-search" placeholder="Search..." onkeyup="filterSearch(this, '${containerId}')">
+                    <label class="select-all-label"><input type="checkbox" checked onchange="toggleSelectAll(this, '${containerId}')"> Select All</label>
+                </div>
+                <div class="checkbox-container" id="list-${containerId}">${listHtml}</div>
+            `;
+        }
+
+        window.filterSearch = function(input, containerId) {
+            const term = input.value.toLowerCase();
+            const labels = document.querySelectorAll(`#list-${containerId} .cb-item`);
+            labels.forEach(label => {
+                const text = label.innerText.toLowerCase();
+                label.style.display = text.includes(term) ? 'flex' : 'none';
+            });
+        };
+
+        window.toggleSelectAll = function(cb, containerId) {
+            const isChecked = cb.checked;
+            const inputs = document.querySelectorAll(`#list-${containerId} .cb-item`);
+            inputs.forEach(label => {
+                if (label.style.display !== 'none') {
+                    label.querySelector('input').checked = isChecked;
+                }
+            });
+            updateDashboard();
+        };
+
+        function getCheckedValues(containerId) {
+            return Array.from(document.querySelectorAll(`#list-${containerId} input:checked`)).map(cb => {
+                return isNaN(cb.value) ? cb.value : parseInt(cb.value);
+            });
+        }
+
+        function getPrevious6Months(maxMonthStr) {
+            let currentStr = maxMonthStr.toString();
+            let year = parseInt(currentStr.substring(0, 4));
+            let month = parseInt(currentStr.substring(4, 6));
+            let prevMonths = [];
+            for (let i = 0; i < 6; i++) {
+                month--;
+                if (month === 0) { month = 12; year--; }
+                let mStr = month < 10 ? '0' + month : month;
+                prevMonths.push(parseInt(`${year}${mStr}`));
+            }
+            return prevMonths;
+        }
+
+        function clearDashboard() {
+            ['inflow','inscope','selected','approved','excl-total','excl-client','excl-exl'].forEach(id => document.getElementById(`kpi-${id}`).innerText = '--');
+            ['inflow','inscope','selected','approved'].forEach(id => {
+                document.getElementById(`bar-${id}`).style.width = '0%';
+                document.getElementById(`delta-${id}`).innerHTML = '';
+            });
+            ['cod','cva','true-auto'].forEach(id => document.getElementById(`kpi-ratio-${id}`).innerText = '--%');
+            document.getElementById('coding-table-container').innerHTML = '';
+            document.getElementById('cva-table-container').innerHTML = '';
+            document.getElementById('dynamic-client').innerText = '';
+            document.getElementById('dynamic-sel').innerText = '';
+            if(codChartInstance) { codChartInstance.data.datasets = []; codChartInstance.update(); }
+            if(cvaChartInstance) { cvaChartInstance.data.datasets = []; cvaChartInstance.update(); }
+        }
+
+        function updateDashboard() {
+            const masterClient = document.querySelector('input[name="master_client"]:checked').value;
+            const selMonths = getCheckedValues('filter-month-run');
+            const selClients = getCheckedValues('filter-client');
+            const selTypes = getCheckedValues('filter-selection-type');
+            const selCodBands = getCheckedValues('filter-cod-band');
+            const selCvaBands = getCheckedValues('filter-cva-band');
+
+            if(!selMonths.length || !selClients.length || !selTypes.length) {
+                clearDashboard();
+                return;
+            }
+
+            // Flanking Dynamic Titles logic
+            document.getElementById('dynamic-client').innerText = selClients.length === 1 ? selClients[0] : '';
+            document.getElementById('dynamic-sel').innerText = selTypes.length === 1 ? selTypes[0] : '';
+
+            const maxMonth = Math.max(...selMonths);
+            const prev6Months = getPrevious6Months(maxMonth);
+            const targetMonths = [...prev6Months, maxMonth];
+
+            const baseFilter = (d) => 
+                d.master_client === masterClient &&
+                selClients.includes(d.client) && 
+                selTypes.includes(d.selection_type) &&
+                (!d.cod_band || selCodBands.includes(d.cod_band)) &&
+                (!d.cva_band || selCvaBands.includes(d.cva_band));
+
+            // Use integer comparison to prevent PapaParse string typing issues
+            const currentData = globalData.filter(d => baseFilter(d) && selMonths.includes(parseInt(d.month_run)));
+            const historicalData = globalData.filter(d => baseFilter(d) && prev6Months.includes(parseInt(d.month_run)));
+            const trendData = globalData.filter(d => baseFilter(d) && targetMonths.includes(parseInt(d.month_run)));
+
+            updateKPIs(currentData, historicalData);
+            updateCategoryPanels(currentData, historicalData, 'COD', 'coding');
+            updateCategoryPanels(currentData, historicalData, 'CVA', 'cva');
+            
+            const goalCod = document.getElementById('goal-cod').value;
+            const goalCva = document.getElementById('goal-cva').value;
+            updateCharts(trendData, 'COD', 'codingChart', goalCod);
+            updateCharts(trendData, 'CVA', 'cvaChart', goalCva);
+        }
+
+        function updateKPIs(curr, hist) {
+            const curInflow = curr.reduce((sum, row) => sum + getNum(row, 'inflow'), 0);
+            const curInscope = curr.reduce((sum, row) => sum + getNum(row, 'inscope'), 0);
+            const curSelected = curr.reduce((sum, row) => sum + getNum(row, 'selected'), 0);
+            const curApproved = curr.reduce((sum, row) => sum + getNum(row, 'approved'), 0);
+
+            const histInflowAvg = hist.reduce((sum, row) => sum + getNum(row, 'inflow'), 0) / 6 || 1; 
+            const histInscopeAvg = hist.reduce((sum, row) => sum + getNum(row, 'inscope'), 0) / 6 || 1;
+            const histSelectedAvg = hist.reduce((sum, row) => sum + getNum(row, 'selected'), 0) / 6 || 1;
+            const histApprovedAvg = hist.reduce((sum, row) => sum + getNum(row, 'approved'), 0) / 6 || 1;
+
+            document.getElementById('kpi-inflow').innerText = curInflow.toLocaleString();
+            document.getElementById('kpi-inscope').innerText = curInscope.toLocaleString();
+            document.getElementById('kpi-selected').innerText = curSelected.toLocaleString();
+            document.getElementById('kpi-approved').innerText = curApproved.toLocaleString();
+
+            const maxVal = curInflow || 1;
+            document.getElementById('bar-inflow').style.width = '100%';
+            document.getElementById('bar-inscope').style.width = `${Math.min((curInscope/maxVal)*100, 100)}%`;
+            document.getElementById('bar-selected').style.width = `${Math.min((curSelected/maxVal)*100, 100)}%`;
+            document.getElementById('bar-approved').style.width = `${Math.min((curApproved/maxVal)*100, 100)}%`;
+
+            const renderDelta = (cur, avg, elementId) => {
+                if(cur === 0 && avg === 1) { document.getElementById(elementId).innerHTML = ""; return; }
+                const diff = ((cur - avg) / avg) * 100;
+                const sign = diff >= 0 ? '▲' : '▼';
+                const color = diff >= 0 ? 'var(--positive)' : 'var(--negative)';
+                document.getElementById(elementId).innerHTML = `<span style="color:${color};">${sign} ${Math.abs(diff).toFixed(2)}%</span>`;
+            };
+
+            renderDelta(curInflow, histInflowAvg, 'delta-inflow');
+            renderDelta(curInscope, histInscopeAvg, 'delta-inscope');
+            renderDelta(curSelected, histSelectedAvg, 'delta-selected');
+            renderDelta(curApproved, histApprovedAvg, 'delta-approved');
+
+            const exlExclusion = curr.reduce((sum, row) => sum + getNum(row, 'exl_exclusion'), 0);
+            const clientExclusion = curr.reduce((sum, row) => sum + getNum(row, 'client_exclusion'), 0);
+            document.getElementById('kpi-excl-total').innerText = (clientExclusion + exlExclusion).toLocaleString();
+            document.getElementById('kpi-excl-client').innerText = clientExclusion.toLocaleString();
+            document.getElementById('kpi-excl-exl').innerText = exlExclusion.toLocaleString();
+
+            const codSelected = curr.filter(d => d.category_insight === 'COD').reduce((sum, row) => sum + getNum(row, 'selected'), 0);
+            const cvaSelected = curr.filter(d => d.category_insight === 'CVA').reduce((sum, row) => sum + getNum(row, 'selected'), 0);
+            const trueAutoVol = curr.filter(d => {
+                if (!d.function_pre) return false;
+                const fp = String(d.function_pre).toLowerCase();
+                return fp.includes('cod_noreview') || fp.includes('cva_noreview');
+            }).reduce((sum, row) => sum + getNum(row, 'selected'), 0);
+
+            document.getElementById('kpi-ratio-cod').innerText = curSelected > 0 ? `${Math.round((codSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-ratio-cva').innerText = curSelected > 0 ? `${Math.round((cvaSelected / curSelected) * 100)}%` : '0%';
+            document.getElementById('kpi-true-auto').innerText = curSelected > 0 ? `${Math.round((trueAutoVol / curSelected) * 100)}%` : '0%';
+        }
+
+        function updateCategoryPanels(curr, hist, insightType, prefix) {
+            const curCatData = curr.filter(d => d.category_insight === insightType);
+            const histCatData = hist.filter(d => d.category_insight === insightType);
+            const categories1 = [...new Set(curCatData.map(d => d.category_1).filter(Boolean))].sort();
+            
+            let html = `<table><tr><th>CATEGORY</th><th>SELECTED</th><th>APPROVED</th><th style="text-align:right;">L6HR</th></tr>`;
+            let totalSel = 0, totalApp = 0;
+            let grandTotalTrue = 0, grandTotalNo = 0; 
+
+            categories1.forEach(cat1 => {
+                const catCurr = curCatData.filter(d => d.category_1 === cat1);
+                const sel = catCurr.reduce((sum, row) => sum + getNum(row, 'selected'), 0);
+                const app = catCurr.reduce((sum, row) => sum + getNum(row, 'approved'), 0);
+                totalSel += sel; totalApp += app;
+
+                // Robust L6HR extraction reflecting the exact SQL CTE mathematics
+                const catHist = histCatData.filter(d => d.category_1 === cat1);
+                const tFind = catHist.reduce((sum, row) => sum + getNum(row, 'true_finding'), 0);
+                const nFind = catHist.reduce((sum, row) => sum + getNum(row, 'no_finding'), 0);
+                
+                grandTotalTrue += tFind;
+                grandTotalNo += nFind;
+
+                let l6hrAvg = 0;
+                if ((tFind + nFind) > 0) {
+                    l6hrAvg = (tFind / (tFind + nFind)) * 100;
+                }
+                
+                const opacity = Math.min(l6hrAvg / 30, 1) * 0.3; 
+                const heatColor = `rgba(2, 132, 199, ${opacity})`;
+
+                html += `<tr><td>${cat1}</td><td>${sel.toLocaleString()}</td><td>${app.toLocaleString()}</td><td class="heatmap-cell" style="background-color: ${heatColor};">${l6hrAvg.toFixed(2)}%</td></tr>`;
+            });
+
+            // Universal Total L6HR aggregation matching SQL nullif
+            let totalL6hrAvg = 0;
+            if ((grandTotalTrue + grandTotalNo) > 0) {
+                totalL6hrAvg = (grandTotalTrue / (grandTotalTrue + grandTotalNo)) * 100;
+            }
+
+            html += `<tr class="total-row"><td>Total</td><td>${totalSel.toLocaleString()}</td><td>${totalApp.toLocaleString()}</td><td style="text-align:right;">${totalL6hrAvg.toFixed(2)}%</td></tr></table>`;
+            document.getElementById(`${prefix}-table-container`).innerHTML = html;
+        }
+
+        function updateCharts(trendData, insightType, canvasId, goalValue) {
+            const catData = trendData.filter(d => d.category_insight === insightType);
+            const grouped = catData.reduce((acc, row) => {
+                if (!acc[row.month_run]) acc[row.month_run] = { sel: 0, app: 0 };
+                acc[row.month_run].sel += getNum(row, 'selected');
+                acc[row.month_run].app += getNum(row, 'approved');
+                return acc;
+            }, {});
+
+            const labels = Object.keys(grouped).sort((a, b) => a - b);
+            const selData = labels.map(l => grouped[l].sel);
+            const appData = labels.map(l => grouped[l].app);
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            
+            if (insightType === 'COD' && codChartInstance) codChartInstance.destroy();
+            if (insightType === 'CVA' && cvaChartInstance) cvaChartInstance.destroy();
+
+            const masterThemeColor = document.querySelector('input[name="master_client"]:checked').value === 'Aetna' ? '#702082' : '#0284c7';
+
+            const newChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'APPROVED',
+                            data: appData,
+                            borderColor: masterThemeColor,
+                            backgroundColor: masterThemeColor,
+                            borderWidth: 2,
+                            pointRadius: 4,
+                            fill: false,
+                            datalabels: { align: 'bottom', anchor: 'bottom', offset: 4 }
+                        },
+                        {
+                            label: 'SELECTED',
+                            data: selData,
+                            borderColor: '#94a3b8',
+                            backgroundColor: '#94a3b8',
+                            borderWidth: 2,
+                            borderDash: [5, 5],
+                            pointRadius: 4,
+                            fill: false,
+                            datalabels: { align: 'top', anchor: 'top', offset: 4 }
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false, 
+                    animation: false,
+                    layout: { 
+                        padding: { 
+                            top: 20, 
+                            bottom: 40, // Significant boost to give the X-axis labels plenty of breathing room
+                            left: 10, 
+                            right: 10 
+                        } 
+                    },
+                    plugins: { 
+                        legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8 } },
+                        datalabels: {
+                            color: (context) => context.dataset.borderColor,
+                            font: { weight: 'bold', size: 10 },
+                            formatter: (value) => value >= 1000 ? (value / 1000).toFixed(1) + 'k' : value
+                        },
+                        annotation: {
+                            annotations: {
+                                goalLine: {
+                                    type: 'line',
+                                    yMin: goalValue,
+                                    yMax: goalValue,
+                                    borderColor: 'rgba(220, 38, 38, 0.4)',
+                                    borderWidth: 2,
+                                    borderDash: [4, 4],
+                                    label: { 
+                                        display: true, 
+                                        content: `Goal: ${goalValue}`, 
+                                        position: 'start',
+                                        backgroundColor: 'transparent', 
+                                        color: '#dc2626',
+                                        font: {size: 11, weight: 'bold'},
+                                        yAdjust: -12 
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: { beginAtZero: true, grid: { color: '#f1f5f9' }, suggestedMax: Math.max(...selData, goalValue) * 1.15 },
+                        x: { grid: { display: false } }
+                    }
+                }
+            });
+
+            if (insightType === 'COD') codChartInstance = newChart;
+            if (insightType === 'CVA') cvaChartInstance = newChart;
+        }
+    </script>
+</body>
+</html>
