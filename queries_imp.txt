@@ -187,3 +187,97 @@ ORDER BY
 
 ```
 **The Insight:** Using a Z-score calculation (standard deviations from the mean), this query mathematically identifies facilities that are price-gouging or over-utilizing the Emergency Department prior to an inpatient admission. If a hospital has a Z-score of 3.0 or higher, it means their ER billing practices are statistically highly anomalous compared to every other hospital in their state, giving your audit team a mathematically defensible reason to initiate a targeted record request.
+
+
+#Advance_response2
+That is a critical distinction that completely shifts the analytical paradigm. If the renderingprovidernpi column in your dataset actually represents a Billing NPI (a Type 2 Organizational NPI) rather than an individual physician (Type 1 NPI), we must change our focus from identifying "rogue individuals" to detecting systemic corporate fraud, "shell" billing entities, and centralized upcoding mills.
+In this structure, you have three distinct corporate layers:
+ * ProviderTaxID: The overarching corporate owner or parent company.
+ * renderingprovidernpi (Billing NPI): The centralized organizational entity generating and submitting the claims.
+ * npinumber (Facility NPI): The specific physical hospital location where the care was purportedly delivered.
+Here are the three advanced FWA (Fraud, Waste, and Abuse) SQL scenarios, fully rewritten and re-logicked to anchor on revenue codes while exposing organizational-level fraud networks.
+1. The "Shell Company" Carve-Out Dilution Network
+The FWA Concept: High-cost carve-outs like surgical implants (revenue code 0278) and specialty drugs (revenue code 0636) are heavily scrutinized. To avoid detection, a sophisticated corporate fraud ring might use a single, centralized "shell" Billing NPI (renderingprovidernpi) to submit fraudulent carve-out charges, but route those claims through multiple different physical Facility NPIs (npinumber). By spreading the fraudulent implants across many physical locations, the Billing NPI dilutes the volume at any single hospital, successfully bypassing payer thresholds that flag excessive implant use.
+The Query:
+SELECT 
+    renderingprovidernpi AS billing_npi,
+    drgcode,
+    revenuecode,
+    COUNT(DISTINCT ProviderTaxID) AS distinct_corporate_entities,
+    COUNT(DISTINCT npinumber) AS distinct_physical_facilities,
+    COUNT(ClaimNumber) AS total_carveout_claims,
+    AVG(TotalChargedAmount) AS avg_carveout_charge,
+    SUM(TotalPaidAmount) AS total_paid_for_carveout
+FROM claim_table
+WHERE revenuecode IN ('0278', '0636') 
+  AND renderingprovidernpi IS NOT NULL
+GROUP BY 
+    renderingprovidernpi, 
+    drgcode,
+    revenuecode
+HAVING 
+    COUNT(DISTINCT npinumber) >= 3 
+    AND COUNT(ClaimNumber) > 15
+ORDER BY 
+    total_paid_for_carveout DESC;
+
+The Insight: Instead of looking for a single doctor traveling between hospitals, this flags a centralized billing organization that is pumping high-dollar supply charges through three or more different physical facilities for the exact same DRG. If a single Billing NPI is maxing out implant charges across a wide network of unaffiliated facility NPIs, it strongly signals organized corporate billing abuse or an illicit kickback scheme with a device manufacturer.
+2. Centralized "Phantom Surgery" Upcoding Mills
+The FWA Concept: Hospitals receive massive payment bumps when a claim groups to a surgical DRG. However, a surgical DRG requires the use of an Operating Room, which must be billed using revenue codes starting with 036X. If a centralized Billing NPI is manipulating diagnosis and procedure codes to falsely trigger surgical DRGs, the physical Facility NPI's claim lines will often lack the corresponding 036X revenue codes, creating a digital mismatch.
+The Query:
+SELECT 
+    ProviderTaxID,
+    renderingprovidernpi AS billing_npi,
+    npinumber AS physical_facility_npi,
+    drgcode,
+    COUNT(ClaimNumber) AS phantom_surgery_claims,
+    SUM(TotalPaidAmount) AS fraudulent_paid_exposure
+FROM claim_table
+WHERE surgdrg_count > 0 
+GROUP BY 
+    ProviderTaxID,
+    renderingprovidernpi,
+    npinumber,
+    drgcode
+HAVING 
+    SUM(CASE WHEN revenuecode LIKE '036%' THEN 1 ELSE 0 END) = 0
+    AND COUNT(ClaimNumber) > 5
+ORDER BY 
+    fraudulent_paid_exposure DESC;
+
+The Insight: Because renderingprovidernpi is an organizational identifier here, surfacing claims in this query indicates a systemic, software-driven problem at the billing office level. The centralized billing entity is applying algorithms that alter the DRG to a surgical tier, but they are failing to ensure the physical facility actually generated Operating Room charges to support the story. This provides auditors with concrete proof of organizational-level DRG fabrication.
+3. Automated ER "Severity Padding" by Billing Office
+The FWA Concept: Some corporate hospital networks deploy aggressive, automated clinical documentation improvement (CDI) software at their central billing office to retroactively inflate patient severity. They focus on patients entering through the Emergency Room (revenue codes 045X), pushing minor symptoms into Major Complications or Comorbidities (mcc_drg = 1). Because these patients weren't actually critically ill, they are discharged in 48 hours or less, creating a clinical impossibility.
+The Query:
+WITH Centralized_ER_Metrics AS (
+    SELECT 
+        ProviderTaxID,
+        renderingprovidernpi AS billing_npi,
+        drgcode,
+        COUNT(ClaimNumber) AS er_mcc_short_stays,
+        SUM(TotalPaidAmount) AS total_paid_amount
+    FROM claim_table
+    WHERE revenuecode LIKE '045%' 
+      AND mcc_drg = 1 
+      AND lengthofstay <= 2 
+      AND billtypecode LIKE '011%' 
+    GROUP BY 
+        ProviderTaxID,
+        renderingprovidernpi,
+        drgcode
+)
+SELECT 
+    ProviderTaxID,
+    billing_npi,
+    drgcode,
+    er_mcc_short_stays,
+    total_paid_amount,
+    (total_paid_amount / er_mcc_short_stays) AS avg_paid_per_short_stay
+FROM Centralized_ER_Metrics
+WHERE er_mcc_short_stays > 20 
+ORDER BY 
+    er_mcc_short_stays DESC, 
+    total_paid_amount DESC;
+
+The Insight: By tracking this at the renderingprovidernpi (Billing NPI) level rather than the local facility level, you can prove that the upcoding is a top-down corporate mandate rather than a localized mistake. If a specific billing entity is churning out hundreds of short-stay, high-severity ER claims, they are likely using centralized software to "pad" the diagnosis codes before the claims hit the payer.
+
