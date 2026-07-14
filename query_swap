@@ -1,0 +1,202 @@
+/* ============================================================
+DRG Downgrade Escalation Candidate Finder
+------------------------------------------------------------
+Purpose:
+Identify claims currently landing in Bucket 1 (Drop single)
+or Bucket 3 (Swap) that carry an ADDITIONAL, unused CC/MCC-
+qualifying secondary diagnosis -- i.e. candidates to escalate
+to Bucket 2 (Drop double) or Bucket 4 (Swap & drop).
+Also flags claims where the principal diagnosis on the FROM-DRG
+reappears as a secondary diagnosis on the same claim.
+
+Built on top of your existing grp / base_data / categorized CTEs
+(from the 11:FINAL notebook) -- unchanged, just extended.
+
+THINGS YOU NEED TO FILL IN BEFORE RUNNING:
+
+1. <claim_dx_table> -- your claim-level table with diag1..diagN.
+Update the STACK() column list below to match how many
+diagnosis columns you actually have (UB-04 supports up to 25).
+
+2. ccmcc_ref -- STUB TABLE. You said there's no confirmed
+diagnosis-level CC/MCC mapping yet. Two ways to get one:
+a) Check if a severity-by-diagnosis table already exists
+alongside prod.common_silver.drgcode (ask your data team --
+it's common to have one even if this pipeline isn't using it).
+b) Load CMS's published MS-DRG CC/MCC Exclusion List
+(Table 6I = CC list, Table 6J = MCC list, from the annual
+IPPS/MS-DRG Definitions Manual) as a 2-column reference:
+(diagnosis_code, ccmcc_flag).
+Until this is populated, secondary_ccmcc_count will be 0 for
+every claim and no escalation candidates will surface --
+that's expected, not a bug.
+
+3. "Challengeable" flag -- none confirmed either. As a proxy,
+a secondary diagnosis counts as a candidate only if:
+- it's on ccmcc_ref as CC or MCC, AND
+- it isn't the same code already driving the FROM-DRG severity.
+This is a coarse proxy and WILL overflag some claims (e.g. codes
+that are present but excluded by CMS's own exclusion pairing
+rules aren't handled here). Treat the output as a review queue
+for coders/auditors, not an auto-reclassification.
+============================================================ */
+
+WITH grp AS (
+SELECT DRGCODE, GRP_NO,
+CASE
+WHEN Split_Bucket LIKE '%with MCC%' THEN 'MCC'
+WHEN Split_Bucket LIKE '%with CC/MCC%' THEN 'CC'
+WHEN Split_Bucket LIKE '%with CC%' THEN 'CC'
+WHEN Split_Bucket LIKE '%without CC/MCC%' THEN 'BASE'
+WHEN Split_Bucket LIKE '%without MCC%' THEN 'BASE'
+WHEN Split_Bucket LIKE '%without CC%' THEN 'BASE'
+WHEN Split_Bucket IS NULL THEN 'BASE'
+ELSE 'BASE'
+END AS drg_level
+FROM prod.humana_gold.drg_grp_no_mapping
+),
+
+base_data AS (
+SELECT m.claimsummaryedenuid, m.fromdrg, m.todrg, m.exl_finding, m.exl_nofinding, m.exl_savings, m.audit_type,
+m.drgconditiontype AS fromdrg_cd, d.DRGconditiontype AS todrg_cd,
+e.DRGDescription fromdrg_desc, d.DRGDescription todrg_desc
+FROM mldev.humana_gold.drg_hummart m
+JOIN prod.common_silver.drgcode d
+ON m.todrg = d.DRGCode
+AND (m.lastdateofservice BETWEEN d.EffectiveDate AND d.Termdate)
+JOIN prod.common_silver.drgcode e
+ON m.fromdrg = e.DRGCode
+AND (m.lastdateofservice BETWEEN e.EffectiveDate AND e.Termdate)
+WHERE m.fromdrg IS NOT NULL AND m.todrg IS NOT NULL
+AND upper(vendor) IN ('NAS') AND inclusionflag = 1
+),
+
+categorized AS (
+SELECT
+b.*,
+fg.GRP_NO AS from_grp, fg.drg_level AS from_level,
+tg.GRP_NO AS to_grp,   tg.drg_level AS to_level,
+CASE
+WHEN fg.GRP_NO = tg.GRP_NO AND fg.drg_level = 'MCC' AND tg.drg_level = 'BASE'
+THEN '2 - Drop double'
+WHEN fg.GRP_NO = tg.GRP_NO
+AND ((fg.drg_level = 'MCC' AND tg.drg_level = 'CC')
+OR (fg.drg_level = 'CC' AND tg.drg_level = 'BASE'))
+THEN '1 - Drop single'
+WHEN fg.GRP_NO != tg.GRP_NO AND fg.drg_level = tg.drg_level
+THEN '3- Swap'
+WHEN fg.GRP_NO != tg.GRP_NO AND (
+(fg.drg_level = 'BASE')
+OR (fg.drg_level = 'CC' AND tg.drg_level IN ('BASE'))
+OR (fg.drg_level = 'MCC' AND tg.drg_level IN ('CC','BASE')))
+THEN '4 - Swap & drop'
+WHEN fg.GRP_NO = tg.GRP_NO
+THEN '5 - Downgraded with Same Family'
+ELSE 'Unclassified'
+END AS bucket
+FROM base_data b
+LEFT JOIN grp fg ON CAST(b.fromdrg AS INT) = fg.DRGCODE
+LEFT JOIN grp tg ON CAST(b.todrg AS INT) = tg.DRGCODE
+),
+
+-- === NEW: unpivot wide diagnosis columns into one row per claim/diagnosis ===
+-- Edit the STACK() list to match your real diag1..diagN columns.
+dx_long AS (
+SELECT claimsummaryedenuid, dx_position, diagnosis_code
+FROM <claim_dx_table>
+LATERAL VIEW STACK(
+25,
+1,  diag1,
+2,  diag2,
+3,  diag3,
+4,  diag4,
+5,  diag5,
+6,  diag6,
+7,  diag7,
+8,  diag8,
+9,  diag9,
+10, diag10,
+11, diag11,
+12, diag12,
+13, diag13,
+14, diag14,
+15, diag15,
+16, diag16,
+17, diag17,
+18, diag18,
+19, diag19,
+20, diag20,
+21, diag21,
+22, diag22,
+23, diag23,
+24, diag24,
+25, diag25
+) exploded AS dx_position, diagnosis_code
+WHERE diagnosis_code IS NOT NULL AND diagnosis_code != ''
+),
+
+-- STUB reference -- replace with a real table once you find/build one (see notes above)
+ccmcc_ref AS (
+SELECT diagnosis_code, ccmcc_flag  -- expects 'CC' or 'MCC'
+FROM <your_ccmcc_lookup_table>
+),
+
+dx_principal AS (
+SELECT claimsummaryedenuid, diagnosis_code AS principal_dx
+FROM dx_long
+WHERE dx_position = 1
+),
+
+dx_secondary_check AS (
+SELECT
+d.claimsummaryedenuid,
+COUNT(DISTINCT CASE WHEN r.ccmcc_flag IN ('CC','MCC') THEN d.diagnosis_code END) AS secondary_ccmcc_count,
+MAX(CASE WHEN d.diagnosis_code = p.principal_dx THEN 1 ELSE 0 END) AS principal_in_secondary_flag
+FROM dx_long d
+JOIN dx_principal p ON d.claimsummaryedenuid = p.claimsummaryedenuid
+LEFT JOIN ccmcc_ref r ON d.diagnosis_code = r.diagnosis_code
+WHERE d.dx_position > 1
+GROUP BY d.claimsummaryedenuid
+)
+
+-- === OUTPUT A: claim-level review queue ===
+SELECT
+c.claimsummaryedenuid,
+c.fromdrg, c.todrg, c.fromdrg_desc, c.todrg_desc,
+c.bucket,
+s.secondary_ccmcc_count,
+s.principal_in_secondary_flag,
+c.exl_savings,
+CASE
+WHEN c.bucket = '1 - Drop single' AND s.secondary_ccmcc_count >= 1
+THEN 'Candidate: escalate to Drop double'
+WHEN c.bucket = '3- Swap' AND s.secondary_ccmcc_count >= 1
+THEN 'Candidate: escalate to Swap & drop'
+ELSE 'No change'
+END AS bucket_refined
+FROM categorized c
+LEFT JOIN dx_secondary_check s ON c.claimsummaryedenuid = s.claimsummaryedenuid
+WHERE s.secondary_ccmcc_count >= 1  -- drop this filter to see all claims, not just candidates
+ORDER BY c.exl_savings DESC;
+
+
+-- === OUTPUT B: aggregate impact estimate (run separately) ===
+-- Shows current vs. candidate volume/savings by bucket so you can
+-- see the potential lift BEFORE any claims are actually reclassified.
+/*
+SELECT
+c.bucket,
+CASE
+WHEN c.bucket = '1 - Drop single' AND s.secondary_ccmcc_count >= 1 THEN 'Candidate: escalate to Drop double'
+WHEN c.bucket = '3- Swap' AND s.secondary_ccmcc_count >= 1 THEN 'Candidate: escalate to Swap & drop'
+ELSE c.bucket
+END AS bucket_refined,
+COUNT(*) AS claim_count,
+SUM(c.exl_finding) AS findings,
+SUM(c.exl_savings) AS total_savings,
+SUM(c.exl_savings) / NULLIF(SUM(c.exl_finding), 0) AS avg_savings
+FROM categorized c
+LEFT JOIN dx_secondary_check s ON c.claimsummaryedenuid = s.claimsummaryedenuid
+GROUP BY ALL
+ORDER BY bucket_refined;
+*/
