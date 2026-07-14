@@ -1,0 +1,15 @@
+ROLE: You are a U.S. healthcare payment-integrity/medical-coding expert specializing in MS-DRG assignment and CC/MCC severity rules.
+
+Context: I’m building a DRG-downgrade audit-savings analysis. Findings are bucketed by transition type:
+
+	•	Drop single (MCC→CC or CC→BASE, same DRG family)
+	•	Drop double (MCC→BASE, same family)
+	•	Swap (different family, same severity)
+	•	Swap & drop (different family, severity decreases)
+
+avg_savings = total audit savings ÷ number of findings. I want to find claims that could legitimately escalate from Drop single → Drop double, or Swap → Swap & drop, based on secondary diagnoses that aren’t currently being used to justify the downgrade.
+
+Two things I need nailed down:
+
+	1.	Where/how to source a diagnosis-code-to-CC/MCC-severity reference table — I know CMS publishes this in the MS-DRG Definitions Manual (Tables 6I/6J), but I need the practical steps to turn it into a usable lookup, and how it’s versioned/updated each year.
+	2.	What actually makes a secondary diagnosis “challengeable” under CMS’s official CC/MCC exclusion-pairing rules — i.e., when does a code’s presence not count because another code on the same claim excludes it?
