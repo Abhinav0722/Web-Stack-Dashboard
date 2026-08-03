@@ -1,0 +1,51 @@
+Handling a comma-separated string of revenue codes requires a two-step approach: first, transforming the data so it can be analyzed, and second, visualizing it in a way that doesn't overwhelm your audience.
+Because standard SQL cannot aggregate a concatenated string directly, you must unnest (or "explode") the string into individual rows before running your analysis. Since you are working in Azure Databricks, you can use the EXPLODE and SPLIT functions to achieve this seamlessly.
+Step 1: The Databricks SQL Transformation
+Here is the query to flatten the comma-separated strings, filter for the COSMOS client, and aggregate the total claims and spend per individual revenue code.
+WITH Unnested_Codes AS (
+    SELECT 
+        ClaimNumber,
+        TotalPaidAmount,
+        -- Splits the string by comma and explodes it into a new row for each code
+        EXPLODE(SPLIT(revenuecode, ',')) AS individual_rev_code 
+    FROM claim_table
+    WHERE ClientSystemName_cs = 'COSMOS'
+      -- Ensure we only process rows that actually have revenue codes
+      AND revenuecode IS NOT NULL 
+)
+SELECT 
+    individual_rev_code,
+    COUNT(DISTINCT ClaimNumber) AS total_claims,
+    -- Dividing the paid amount by the number of codes on the claim prevents 
+    -- over-counting the total spend when exploding the rows
+    SUM(TotalPaidAmount / SIZE(SPLIT(revenuecode, ','))) AS allocated_spend
+FROM Unnested_Codes
+GROUP BY individual_rev_code
+ORDER BY allocated_spend DESC;
+
+Step 2: The Presentation Strategy
+When you have hundreds of distinct revenue codes, putting them all on a single chart is unreadable. To present this effectively, you need to group the codes into logical clinical or financial buckets based on their first three digits, then drill down into the specifics.
+Here is how to structure a four-slide presentation, keeping the points strictly within the context of the provided claim data and financial metrics.
+Slide 1: Executive Summary - COSMOS Client
+ * Visual: High-level KPIs in large text (Total Spend, Total Claims, Unique Revenue Codes Billed).
+ * Key Point: State the overarching financial footprint of the COSMOS client and the density of the billing lines being analyzed.
+ * Context: "For the COSMOS client, $X million in paid claims was distributed across Y distinct revenue codes, heavily concentrated in surgical and pharmacy charges."
+Slide 2: The Macro View (Spend by Category)
+ * Visual: A Donut Chart or Treemap.
+ * Data Prep: Group the individual_rev_code output from your SQL query into broader categories:
+   * 011X - 021X: Room & Board / ICU Accommodation
+   * 025X - 026X: Pharmacy & IV Therapy
+   * 027X - 028X: Medical & Surgical Supplies / Implants
+   * 036X - 037X: Operating Room / Anesthesia
+   * 045X: Emergency Room
+ * Key Point: Show the audience where the bulk of the money goes structurally before looking at individual codes.
+Slide 3: The Micro View (Top 10 Cost Drivers)
+ * Visual: A horizontal Bar Chart.
+ * Data Prep: Display only the Top 10 individual revenue codes by allocated_spend from your SQL output.
+ * Key Point: Highlight exactly which specific codes are driving the categories seen on Slide 2. For example, explicitly point out if 0278 (Implants) is overshadowing 0120 (Semi-Private Room).
+Slide 4: Audit Vulnerability Overlay
+ * Visual: A Scatter Plot or Bubble Chart.
+ * Data Prep: Map the Top 15 revenue codes on two axes:
+   * X-Axis: Total Spend (allocated_spend)
+   * Y-Axis: Audit Hit Rate (ratio of true_finding to total claims for that code).
+ * Key Point: Connect the revenue code distribution to the auditresult. Identify codes that have high spend but low true finding rates (wasted audit effort) versus codes with high spend and high finding rates (prime targets for future audit selection).
