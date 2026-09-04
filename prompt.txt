@@ -1,3 +1,18 @@
+AETNA HRP Insights
+ * Primary Driver — Historical Backlog Freeze: Accounting for 66.8% of the overall dip, historical claim selections collapsed by 70% (down to 371 selected from an average of 1,233). This was purely a processing bottleneck rather than a lack of inventory.
+   * Key Pocket Losses: The steepest historical declines occurred in CVA Rules Only / CVA (-217 claims), COD Rules Only / Coding (-214 claims), and COD Model Only / cod_noreview (-108 claims).
+ * Secondary Driver — Monthly Selection Rate Drop: Responsible for 33.2% of the dip, the monthly selection rate dropped to a window-low of 10.1% despite strong inscope volume (31,263 claims).
+   * Key Pocket Losses: Major hits came from CVA Rules Only / cva_noreview falling by -286 claims and a total shutdown of cva_review2 (-114 claims combined).
+ * Band Breakdown: Losses were heavily concentrated in Grey & Amber COD bands (69% of dip) and Red & Amber CVA bands (74% of dip).
+AETNA ACAS Insights
+ * Primary Driver — Historical Selection Breakdown: Driving 86.1% of the overall dip, historical selections plunged 62% (down to 67 selected from an average of 176).
+   * Key Pocket Losses: The drop was almost entirely within Coding, led by COD Rules Only / Coding (-56 claims; 43.9% dip share) and Model Prioritized / Coding (-19 claims; 14.7% dip share).
+ * Functional Impact — Coding Dominance: The Coding function accounted for 96.3% of the total dip (-122 claims), pushing selection rates down to 8.9% even with record-high inscope volume (5,828 claims).
+ * Minor Driver — Monthly Re-Routing: Monthly volume had a minimal impact (14.2% of dip / -18 claims). A drop in CVA Rules & Model / cva_noreview (-49 claims) was mostly offset by gains in cod_noreview (+39 claims), showing function re-routing rather than true volume loss.
+ * Band Breakdown: Primary segment drivers were Red CVA (71.1% of dip) and Amber COD (58.4% of dip).
+
+
+
 ROLE: You are a U.S. healthcare payment-integrity/medical-coding expert specializing in MS-DRG assignment and CC/MCC severity rules.
 
 Context: I’m building a DRG-downgrade audit-savings analysis. Findings are bucketed by transition type:
