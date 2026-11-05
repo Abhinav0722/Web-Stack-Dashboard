@@ -28,3 +28,545 @@ Two things I need nailed down:
 
 	1.	Where/how to source a diagnosis-code-to-CC/MCC-severity reference table — I know CMS publishes this in the MS-DRG Definitions Manual (Tables 6I/6J), but I need the practical steps to turn it into a usable lookup, and how it’s versioned/updated each year.
 	2.	What actually makes a secondary diagnosis “challengeable” under CMS’s official CC/MCC exclusion-pairing rules — i.e., when does a code’s presence not count because another code on the same claim excludes it?
+
+
+
+
+
+
+
+Your pipeline requires manual clones, UPDATEs, and DELETEs because five upstream data anomalies are currently being fixed after data lands in Delta tables rather than during ingestion and transformation.
+1. Root Cause Diagnosis Matrix
+| Issue | What Is Happening Now | Why Your Current Patches Keep Breaking | The Permanent Architectural Fix |
+|---|---|---|---|
+| 1. Cosmos SelectionMonth / month_run Shift | Upstream drg_initalselection labels SelectionMonth using the raw yyMM prefix of DataSourceProcessLogID (dspld). Runs executed on the 28th–31st of Month M-1 (e.g., 260330..., 260430..., 260731..., 260831...) get labeled as Month M-1 instead of Month M, whereas runs on the 1st–5th (260701..., 260901...) get labeled as Month M. | You maintain a manual clone (drg_initalselection_clone) and run manual UPDATE/DELETE patches. In Cell 3 of all_initial, filtering the UPDATE by final_selection = 'selected' split 260330115705069336 across two months (202603 and 202604). Also, integer math (202512 + 2) previously created invalid month_run = '202514'. | Derive month_run directly from the dspld timestamp (yyMMdd): if DAY(dspld_date) >= 25, shift forward +1 month using ADD_MONTHS; otherwise keep the current month. Drop drg_initalselection_clone completely. |
+| 2. Multiple dsplds per month_run | prod.uhccosmosoffshore_gold.drg_initalselection contains multiple dsplds per month (e.g., 6 dsplds in Oct 2026 and 5 in Sep 2026) from weekly/mid-month runs or turn-of-month re-runs (260831... vs. 260901...). | Inserting rows into the clone table (Cell 5 of all_initial) brings in all mid-month dsplds, forcing you to manually delete dsplds until sum(selected) matches the audit email. | Auto-rank dsplds per (client, selection_type, month_run) via DENSE_RANK(): prioritize the dspld whose claims exist in scored_drg_provider_rad_d2 (audit ground truth), and for unaudited current months, pick the latest full-volume run inside the turn-of-month window (DAY >= 25 OR DAY <= 5). |
+| 3. Cirrus 202602 NULLs (true_finding, etc.) | In scored_drg_provider_rad_d2, all 876 selected Cirrus claims for month_run = 202602 were recorded under selectionmonth = 202603. Cell 3 joins on a.month_run = b.selectionmonth, missing all 876 rows. | Cell 7 in report_mart patches 202602 from rad_d1, but only updates 5 columns (selected, approved, finding, no_finding, selectionreason), leaving true_finding (which should sum to 48), td_finding, exl_savings, and status as NULL. | Make the Cell 3 RAD join offset-aware: match b.selectionmonth on a.month_run first, falling back to ADD_MONTHS(a.month_run, 1) when claimsummaryuid matches. Delete Cell 7 completely. |
+| 4. Orphan Duplicates on Re-runs | all_initial unions mldev.uhcunet_gold.all_initial with the source views (select distinct * from all_initial union all ...) and merges on dest.month_run = upd.month_run. | Whenever a month_run label changes (e.g., 202604 \rightarrow 202605), MERGE sees the new month_run as NOT MATCHED and inserts duplicates while keeping the old month_run rows forever. | Remove the self-union in all_initial and use WHEN NOT MATCHED BY SOURCE THEN DELETE (or CREATE OR REPLACE TABLE) so corrected month_run values automatically purge old rows. |
+| 5. Post-Merge Patch Cells (Cells 25 & 28) | Retroactive implant selections have loadmonth + 1 != month_run, setting inflow = 0 and inscope = 0 (Cell 25). Cosmos function_pre has 'Cod_No_Review' instead of 'Cod_NoReview' (Cell 28). | Running UPDATE statements on report_mart after the MERGE adds extra Spark jobs and breaks if run out of order. | Inline both rules into the SELECT queries of all_initial and report_mart. |
+2. Notebook 1 Fix: all_initial (Zero-Clone, Single-dspld Automated Pipeline)
+Replace the cells in your all_initial notebook with the single consolidated PySpark cell below.
+How this solves all_initial permanently:
+ * No Clone Table Needed: Reads directly from prod.uhccosmosoffshore_gold.drg_initalselection.
+ * Smart month_run Calculation: Parses TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd'). For Cosmos/CSP, if the run day is >= 25 (e.g., 260330..., 260430..., 260731..., 260831...), it shifts month_run forward by 1 month (202604, 202605, 202608, 202609); if < 25 (e.g., 260701..., 260901..., 261001..., 261102...), it keeps the same month (202607, 202609, 202610, 202611). This reproduces all 12 SelectionMonth mappings in your clone table automatically.
+ * Automatic Single-dspld Selection per (client, selection_type, month_run): Uses DENSE_RANK() to pick strictly 1 DataSourceProcessLogID per month_run:
+   * Priority 1: Any manual override in dspld_overrides (if you ever need to force a specific dspld).
+   * Priority 2: The dspld that has actual audited/selected claims in scored_drg_provider_rad_d2 (guarantees 100% alignment with the audit upload emails).
+   * Priority 3: For the newest unaudited month (e.g., 202610 / 202611), prioritizes runs in the official monthly window (DAY >= 25 or DAY <= 5) with full claim volume, picking the latest run in that window (e.g., picking 260901... over 260831... for Sep 2026, and 260731... over 260730... for Aug 2026, while ignoring mid-month runs like 261008...–261026...).
+from delta.tables import DeltaTable
+
+table = "mldev.uhcunet_gold.all_initial"
+
+# Optional emergency override: only populate if an off-schedule run ever needs to be forced
+# Format: (client, selection_type, month_run, DataSourceProcessLogID)
+dspld_overrides = [
+    # ('UHCCOSMOS', 'DRG', '202609', '260901081105391116')
+]
+override_df = spark.createDataFrame(
+    dspld_overrides, 
+    schema="client STRING, selection_type STRING, month_run STRING, override_dspld STRING"
+)
+override_df.createOrReplaceTempView("dspld_overrides")
+
+final_df = spark.sql("""
+WITH raw_union AS (
+    -- 1. COSMOS & CSP (Directly from prod gold table - NO CLONE NEEDED)
+    SELECT
+         CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        CASE
+            WHEN functions = 'Cod_No_Review' THEN 'Cod_NoReview'
+            WHEN functions = 'CVA_No_Review' THEN 'CVA_NoReview'
+            ELSE functions
+        END AS function_pre,
+        ProgramName AS selection_type,
+        -- Smart month_run: if dspld date is >= 25th of month (e.g. 260330, 260430, 260731, 260831),
+        -- it belongs to the NEXT month's selection run. If 1st-24th (e.g. 260701, 260901), keep same month.
+        DATE_FORMAT(
+            CASE
+                WHEN DAY(TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd')) >= 25
+                THEN ADD_MONTHS(TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd'), 1)
+                ELSE TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd')
+            END,
+            'yyyyMM'
+        ) AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        CASE WHEN ClientName NOT LIKE '%CSP%' THEN 'UHCCOSMOS' ELSE 'UHCCSP' END AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob
+    FROM prod.uhccosmosoffshore_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 2. UNET
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        functions AS function_pre,
+        ProgramName AS selection_type,
+        DATE_FORMAT(TO_DATE(SelectionMonth, 'MMMMMyyyy'), 'yyyyMM') AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob
+    FROM prod.uhcunet_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 3. CIRRUS
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        functions AS function_pre,
+        ProgramName AS selection_type,
+        DATE_FORMAT(TO_DATE(SelectionMonth, 'MMMMMyyyy'), 'yyyyMM') AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob
+    FROM prod.uhccirrus_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 4. UMR (Note upstream column `function` singular and table `drg_initialselection`)
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        function AS function_pre,
+        ProgramName AS selection_type,
+        DATE_FORMAT(TO_DATE(SelectionMonth, 'MMMMMyyyy'), 'yyyyMM') AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob
+    FROM prod.uhcumr_gold.drg_initialselection
+
+    UNION ALL
+
+    -- 5. Historical Additional Backfill
+    SELECT
+        CAST(a.ClaimSummaryUID AS STRING) AS claimsummaryuid,
+        a.Queryselectionreason AS queryselectionreason,
+        a.category,
+        CAST(a.DataSourceProcessLogId AS STRING) AS DataSourceProcessLogID,
+        a.function_pre,
+        CASE
+            WHEN a.selection_type = 'EquianZero' THEN 'Equian DRG'
+            WHEN a.selection_type = 'default' THEN 'DRG'
+            WHEN a.selection_type = 'EE' THEN 'EE DRG'
+            WHEN a.selection_type = 'ReleasedClaims' THEN 'Released DRG'
+            ELSE a.selection_type
+        END AS selection_type,
+        CAST(a.month_run AS STRING) AS month_run,
+        a.drgcode,
+        a.loadmonth,
+        a.client,
+        a.providertaxid,
+        '' AS binary_flags,
+        '' AS name,
+        b.risk_band AS cod_band,
+        b.probability_score AS cod_prob,
+        c.risk_band AS cva_band,
+        c.probability_score AS cva_prob
+    FROM mldev.uhcunet_gold.drg_sel_inscope a
+    LEFT JOIN prod.uhcunet_gold.datascience_scored b
+        ON a.ClaimSummaryUID = b.claimsummaryedenuid AND UPPER(b.registered_model_name) LIKE '%COD%'
+    LEFT JOIN prod.uhcunet_gold.datascience_scored c
+        ON a.ClaimSummaryUID = c.claimsummaryedenuid AND UPPER(c.registered_model_name) LIKE '%CVA%'
+    WHERE CAST(a.DataSourceProcessLogId AS STRING) IN (
+        '260202060000062301', '250916124507642111', '251201155236503091',
+        '260102121211840884', '250902085212693187', '250702080350185890'
+    )
+),
+
+-- Evaluate each candidate DataSourceProcessLogID against RAD ground truth & schedule window
+dspld_metrics AS (
+    SELECT
+        r.client,
+        r.selection_type,
+        r.month_run,
+        r.DataSourceProcessLogID,
+        COUNT(DISTINCT r.claimsummaryuid) AS total_claims,
+        COUNT(DISTINCT CASE WHEN rad.claimsummaryedenuid IS NOT NULL THEN r.claimsummaryuid END) AS rad_matched_claims,
+        DAY(TO_DATE(SUBSTRING(r.DataSourceProcessLogID, 1, 6), 'yyMMdd')) AS run_day
+    FROM raw_union r
+    LEFT JOIN (
+        SELECT DISTINCT claimsummaryedenuid, CAST(selectionmonth AS STRING) AS selectionmonth
+        FROM mldev.uhcunet_gold.scored_drg_provider_rad_d2
+        WHERE selectionreason IS NOT NULL
+    ) rad
+        ON r.claimsummaryuid = rad.claimsummaryedenuid
+        AND rad.selectionmonth IN (
+            r.month_run,
+            DATE_FORMAT(ADD_MONTHS(TO_DATE(r.month_run, 'yyyyMM'), 1), 'yyyyMM')
+        )
+    GROUP BY r.client, r.selection_type, r.month_run, r.DataSourceProcessLogID
+),
+
+-- Strictly pick 1 winning DataSourceProcessLogID per (client, selection_type, month_run)
+winning_dspld AS (
+    SELECT
+        m.client,
+        m.selection_type,
+        m.month_run,
+        m.DataSourceProcessLogID,
+        ROW_NUMBER() OVER (
+            PARTITION BY m.client, m.selection_type, m.month_run
+            ORDER BY
+                -- 1. Explicit manual override (if any)
+                CASE WHEN o.override_dspld IS NOT NULL THEN 1 ELSE 0 END DESC,
+                -- 2. Ground-truth match in RAD (ensures exact match with email/upload counts)
+                CASE WHEN m.rad_matched_claims > 0 THEN 1 ELSE 0 END DESC,
+                m.rad_matched_claims DESC,
+                -- 3. For Cosmos DRG unaudited months: must be in turn-of-month window (Day >= 25 or Day <= 5)
+                CASE
+                    WHEN m.client IN ('UHCCOSMOS', 'UHCCSP') AND (m.run_day >= 25 OR m.run_day <= 5) THEN 1
+                    WHEN m.client NOT IN ('UHCCOSMOS', 'UHCCSP') THEN 1
+                    ELSE 0
+                END DESC,
+                -- 4. Full monthly volume check (>100k claims for Cosmos DRG)
+                CASE WHEN m.client = 'UHCCOSMOS' AND m.selection_type = 'DRG' AND m.total_claims >= 100000 THEN 1 ELSE 0 END DESC,
+                -- 5. Latest run inside the valid window wins (e.g. 260901 beats 260831; 260731 beats 260730)
+                m.DataSourceProcessLogID DESC
+        ) AS rn
+    FROM dspld_metrics m
+    LEFT JOIN dspld_overrides o
+        ON m.client = o.client
+        AND m.selection_type = o.selection_type
+        AND m.month_run = o.month_run
+        AND m.DataSourceProcessLogID = o.override_dspld
+)
+
+SELECT DISTINCT
+    r.claimsummaryuid,
+    r.queryselectionreason,
+    r.category,
+    r.DataSourceProcessLogID,
+    r.function_pre,
+    r.selection_type,
+    r.month_run,
+    r.drgcode,
+    r.loadmonth,
+    r.client,
+    r.providertaxid,
+    r.binary_flags,
+    r.name,
+    r.cod_band,
+    r.cod_prob,
+    r.cva_band,
+    r.cva_prob
+FROM raw_union r
+INNER JOIN winning_dspld w
+    ON r.client = w.client
+    AND r.selection_type = w.selection_type
+    AND r.month_run = w.month_run
+    AND r.DataSourceProcessLogID = w.DataSourceProcessLogID
+WHERE w.rn = 1
+  AND r.month_run RLIKE '^202[0-9](0[1-9]|1[0-2])$' -- Blocks invalid months like '202514'
+""").dropDuplicates(["claimsummaryuid", "month_run", "selection_type"])
+
+# Self-healing write: overwrites cleanly so old mislabeled month_run rows are automatically purged
+(
+    final_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(table)
+)
+
+3. Notebook 2 Fix: report_mart (Offset-Aware RAD Join & Inline Rules)
+In report_mart, replace Cell 2, Cell 3, and Cell 6 (and delete Cells 7, 12, 25, 26, 27, 28, and 29).
+What this fixes in report_mart:
+ * Fixes Cirrus 202602 NULLs (true_finding = 48) in Cell 3: Instead of joining allclinical to scored_drg_provider_rad_d2 on a.month_run = b.selectionmonth (which misses Cirrus 202602 because RAD recorded those 876 claims under selectionmonth = 202603), the rad_matched CTE matches claimsummaryuid = claimsummaryedenuid where b.selectionmonth is either a.month_run (priority 1) or ADD_MONTHS(a.month_run, +1) (priority 2). Every RAD column (true_finding, td_finding, exl_savings, status, loadmonth_rad, etc.) populates on the first pass.
+ * Fixes Implants & Retroactive inflow / inscope Inline: If b.selectionreason IS NOT NULL (selected = 1) or lower(a.function_pre) LIKE '%implants%', inflow is automatically set to 1 during Cell 3, so inscope is calculated accurately in Cell 5 without needing Cell 25.
+ * Self-Healing Merge (WHEN NOT MATCHED BY SOURCE THEN DELETE): In Cell 6, adding .whenNotMatchedBySourceDelete() to your DeltaTable.merge() ensures that if any month_run or DataSourceProcessLogID ever changes upstream, stale rows in report_mart are automatically deleted.
+Replacement for Cell 2 & Cell 3 in report_mart:
+# CELL 2: Deduplicated Clinical Union (prevents join fan-out)
+spark.sql("""
+WITH raw_clinical AS (
+    SELECT
+        claimsummaryedenuid, mdcn, diag1, proc1, mccall, ccall, c_cc_count, c_mcc_count,
+        discharge_cat, dischargestatuscode, firstdateofservice, lastdateofservice, lengthofstay,
+        CASE WHEN a.vendorid_concat = '100' THEN 1 ELSE 0 END AS no_finding_cotiviti,
+        CASE WHEN a.vendorid_concat = '120' THEN 1 ELSE 0 END AS no_finding_equian,
+        CASE WHEN a.vendorid_concat = '100/120' THEN 1 ELSE 0 END AS no_finding_coti_equi
+    FROM mldev.uhccosmosoffshore_gold.drg_cosmart_102026 a
+    INNER JOIN mldev.uhcunet_gold.all_initial b ON b.claimsummaryuid = a.claimsummaryedenuid
+
+    UNION ALL
+
+    SELECT
+        claimsummaryedenuid, mdcn, diag1, proc1, mccall, ccall, c_cc_count, c_mcc_count,
+        CASE
+            WHEN dischargestatuscode IN ('20','40','41','42') THEN 'Expired'
+            WHEN dischargestatuscode IN ('71','72','00','0') THEN 'Others'
+            WHEN dischargestatuscode IN ('01','07') THEN 'Regular Discharge'
+            WHEN dischargestatuscode IN ('50','51') THEN 'Hospice'
+            ELSE 'Hospital Transfer'
+        END AS discharge_cat,
+        dischargestatuscode, firstdateofservice, lastdateofservice, lengthofstay,
+        CAST(NULL AS INT) AS no_finding_cotiviti,
+        CAST(NULL AS INT) AS no_finding_equian,
+        CAST(NULL AS INT) AS no_finding_coti_equi
+    FROM mldev.uhcunet_gold.drg_unetmart_102026 a
+    INNER JOIN mldev.uhcunet_gold.all_initial b ON b.claimsummaryuid = a.claimsummaryedenuid
+
+    UNION ALL
+
+    SELECT
+        claimsummaryedenuid, mdcn, diag1, proc1, mccall, ccall, c_cc_count, c_mcc_count,
+        CASE
+            WHEN dischargestatuscode IN ('20','40','41','42') THEN 'Expired'
+            WHEN dischargestatuscode IN ('71','72','00','0') THEN 'Others'
+            WHEN dischargestatuscode IN ('01','07') THEN 'Regular Discharge'
+            WHEN dischargestatuscode IN ('50','51') THEN 'Hospice'
+            ELSE 'Hospital Transfer'
+        END AS discharge_cat,
+        dischargestatuscode, firstdateofservice, lastdateofservice, lengthofstay,
+        CAST(NULL AS INT) AS no_finding_cotiviti,
+        CAST(NULL AS INT) AS no_finding_equian,
+        CAST(NULL AS INT) AS no_finding_coti_equi
+    FROM mldev.uhccirrus_gold.drg_cirrusmart_102026 a
+    INNER JOIN mldev.uhcunet_gold.all_initial b ON b.claimsummaryuid = a.claimsummaryedenuid
+
+    UNION ALL
+
+    SELECT
+        claimsummaryedenuid, mdcn, diag1, proc1, mccall, ccall, c_cc_count, c_mcc_count,
+        discharge_cat, dischargestatuscode, firstdateofservice, lastdateofservice, lengthofstay,
+        CAST(NULL AS INT) AS no_finding_cotiviti,
+        CAST(NULL AS INT) AS no_finding_equian,
+        CAST(NULL AS INT) AS no_finding_coti_equi
+    FROM mldev.uhcumr_gold.drg_umrmart_102026 a
+    INNER JOIN mldev.uhcunet_gold.all_initial b ON b.claimsummaryuid = a.claimsummaryedenuid
+)
+SELECT * EXCEPT(rn)
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY claimsummaryedenuid ORDER BY lastdateofservice DESC NULLS LAST) AS rn
+    FROM raw_clinical
+)
+WHERE rn = 1
+""").createOrReplaceTempView("clinical")
+
+spark.sql("""
+SELECT
+    a.*,
+    b.mdcn, b.diag1, b.proc1, b.mccall, b.ccall, b.c_cc_count, b.c_mcc_count,
+    b.discharge_cat, b.dischargestatuscode, b.firstdateofservice, b.lastdateofservice, b.lengthofstay,
+    c.codetype, c.drgconditiontype, c.weights, c.GeometricMeanLOS, c.ArithmeticMeanLOS,
+    b.no_finding_cotiviti, b.no_finding_equian, b.no_finding_coti_equi
+FROM mldev.uhcunet_gold.all_initial a
+LEFT JOIN clinical b
+    ON a.claimsummaryuid = b.claimsummaryedenuid
+LEFT JOIN prod.common_silver.drgcode c
+    ON CAST(a.drgcode AS INT) = c.drgcode
+    AND (b.lastdateofservice >= c.effectivedate AND b.lastdateofservice <= TO_DATE(c.termdate))
+""").createOrReplaceTempView("allclinical")
+
+# CELL 3: Offset-Aware Join to scored_drg_provider_rad_d2 (Eliminates Cell 7 & Cell 25)
+df = spark.sql("""
+WITH rad_matched AS (
+    SELECT
+        a.claimsummaryuid,
+        a.month_run,
+        a.selection_type,
+        b.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.claimsummaryuid, a.month_run, a.selection_type
+            ORDER BY
+                -- Prefer exact month_run = selectionmonth match first; fallback to +1 month offset (fixes Cirrus 202602)
+                CASE WHEN CAST(b.selectionmonth AS STRING) = a.month_run THEN 0 ELSE 1 END ASC,
+                b.audit_selecteddate DESC NULLS LAST
+        ) AS rad_rn
+    FROM allclinical a
+    INNER JOIN mldev.uhcunet_gold.scored_drg_provider_rad_d2 b
+        ON a.claimsummaryuid = b.claimsummaryedenuid
+        AND CAST(b.selectionmonth AS STRING) IN (
+            a.month_run,
+            DATE_FORMAT(ADD_MONTHS(TO_DATE(a.month_run, 'yyyyMM'), 1), 'yyyyMM')
+        )
+)
+SELECT
+    a.claimsummaryuid,
+    a.queryselectionreason,
+    a.category,
+    CAST(a.DataSourceProcessLogId AS STRING) AS DataSourceProcessLogId,
+    CASE
+        WHEN a.function_pre = 'Cod_No_Review' THEN 'Cod_NoReview'
+        WHEN a.function_pre = 'CVA_No_Review' THEN 'CVA_NoReview'
+        ELSE a.function_pre
+    END AS function_pre,
+    a.selection_type,
+    a.month_run,
+    a.drgcode,
+    a.client,
+    a.providertaxid,
+    CASE
+        WHEN a.selection_type IN ('Equian DRG', 'EE DRG', 'Released DRG') THEN 1
+        WHEN LOWER(a.function_pre) LIKE '%implants%' THEN 1
+        WHEN b.selectionreason IS NOT NULL THEN 1 -- Ensures any selected claim has inflow=1 & inscope=1
+        WHEN a.client = 'UHCCOSMOS'
+             AND DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 2), 'yyyyMM') = a.month_run THEN 1
+        WHEN DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 1), 'yyyyMM') = a.month_run THEN 1
+        ELSE 0
+    END AS inflow,
+    a.binary_flags,
+    a.name,
+    a.cod_band,
+    a.cod_prob,
+    a.cva_band,
+    a.cva_prob,
+    a.mdcn,
+    a.diag1,
+    a.proc1,
+    a.mccall,
+    a.ccall,
+    a.c_cc_count,
+    a.c_mcc_count,
+    a.discharge_cat,
+    a.dischargestatuscode,
+    a.firstdateofservice,
+    a.lastdateofservice,
+    a.lengthofstay,
+    a.codetype,
+    a.drgconditiontype,
+    a.weights,
+    a.GeometricMeanLOS,
+    a.ArithmeticMeanLOS,
+    a.loadmonth,
+    CASE WHEN b.selectionreason IS NULL THEN 0 ELSE 1 END AS selected,
+    CASE WHEN b.clientapprovaldate IS NULL THEN 0 ELSE 1 END AS approved,
+    b.clientapprovaldate,
+    b.initial_review,
+    b.locked_claims,
+    b.standardsubstatus,
+    b.status,
+    b.finding,
+    b.no_finding,
+    b.pending,
+    b.selectionreason,
+    b.mr_rec AS mr_received,
+    b.mr_req AS mr_requested,
+    b.mr_after_td,
+    b.tdsentdate,
+    b.RevenueCode,
+    b.true_finding,
+    b.ot_wo_td,
+    b.find_wo_td,
+    b.flowname,
+    b.loadmonth AS loadmonth_rad,
+    CASE WHEN b.true_finding = 1 THEN b.true_find_savings_pod ELSE 0 END AS exl_savings,
+    b.td_finding,
+    b.totalpaid,
+    b.parcode,
+    b.Appeal,
+    b.appeal_overturned,
+    b.upheld_Flag,
+    b.category AS category_rad,
+    b.auditmonth,
+    b.selectionmonth AS audit_selecteddate,
+    b.invoiced_month AS invoicedate,
+    b.ot_after_td,
+    b.td_savings,
+    b.standalone,
+    b.commercial_drgs,
+    b.Finding_No_Recoupment,
+    b.subprogramtype,
+    a.no_finding_cotiviti,
+    a.no_finding_equian,
+    a.no_finding_coti_equi
+FROM allclinical a
+LEFT JOIN rad_matched b
+    ON a.claimsummaryuid = b.claimsummaryuid
+    AND a.month_run = b.month_run
+    AND a.selection_type = b.selection_type
+    AND b.rad_rn = 1
+""")
+
+Replacement for Cell 6 in report_mart (Self-Healing Merge):
+Keep Cells 4 and 5 as they are, and update Cell 6 to include .whenNotMatchedBySourceDelete() so orphan rows from old month_run values are automatically cleaned up without manual DELETEs:
+from delta.tables import DeltaTable
+
+primary_key_column = "claimsummaryuid"
+table = "mldev.uhcunet_gold.report_mart"
+
+final_df = final_df.dropDuplicates([primary_key_column, "month_run", "selection_type"])
+delta_table = DeltaTable.forName(spark, table)
+
+update_condition = " OR ".join([
+    f"NOT (dest.{col} <=> upd.{col})"
+    for col in final_df.columns
+    if col not in [primary_key_column, "month_run", "selection_type"]
+])
+
+(
+    delta_table.alias("dest")
+    .merge(
+        final_df.alias("upd"),
+        f"dest.{primary_key_column} = upd.{primary_key_column} "
+        f"AND dest.month_run = upd.month_run "
+        f"AND dest.selection_type = upd.selection_type"
+    )
+    .whenMatchedUpdate(
+        condition=update_condition,
+        set={col: f"upd.{col}" for col in final_df.columns}
+    )
+    .whenNotMatchedInsertAll()
+    .whenNotMatchedBySourceDelete()  # Automatically purges any stale/re-labeled month_run rows
+    .execute()
+)
+
+(Note: Using Spark's null-safe equality operator NOT (dest.col <=> upd.col) replaces the verbose dest.col <> upd.col OR (dest.col IS NULL AND ...) expression while remaining 100% semantically identical.)
+4. Automated Reconciliation & Guardrail Cell (Add to End of report_mart)
+Add this final validation cell at the bottom of report_mart. It verifies that every (client, selection_type, month_run) has strictly 1 DataSourceProcessLogId and outputs the exact metrics needed to compare against your monthly audit emails (such as sum(selected) = 713 for Cirrus 202609 and 597 for Cirrus 202608, and sum(true_finding) = 48 for Cirrus 202602):
+%sql
+SELECT
+    client,
+    month_run,
+    COUNT(DISTINCT DataSourceProcessLogId) AS dspld_count,
+    FIRST(DataSourceProcessLogId) AS active_dspld,
+    MAX(CASE WHEN inflow = 1 THEN loadmonth END) AS inflow_loadmonth,
+    SUM(inflow) AS total_inflow,
+    SUM(inscope) AS total_inscope,
+    SUM(selected) AS total_selected_mail_check,
+    SUM(approved) AS total_approved,
+    SUM(true_finding) AS total_true_finding,
+    SUM(no_finding) AS total_no_finding
+FROM mldev.uhcunet_gold.report_mart
+WHERE selection_type = 'DRG'
+GROUP BY client, month_run
+ORDER BY client, month_run DESC;
+
+Would you like to convert the fun and fun1 Python UDFs in Cell 4 into native Spark SQL expressions as well to speed up the report_mart build?
