@@ -1,0 +1,688 @@
+Comparing your earlier exp_data screenshot against mldev.uhcunet_gold.report_mart_v2 reveals why report_mart (base_data) was unreliable and why a few historical numbers differed:
+ * 202605 and 202604 in exp_data already match report_mart_v2 on inflow and inscope:
+   * For 202605 (260430082428176529), exp_data produced inscope = 44080 and selected = 6824 — which is an exact match to report_mart_v2 (inflow = 62240, inscope = 44080, selected = 6824).
+   * For 202604 (260330115705069336), exp_data produced inscope = 43143 — also an exact match to report_mart_v2 (inflow = 60224, inscope = 43143). This confirms report_mart (base_data) was corrupted by the manual UPDATE statements in Cells 12 and 29.
+ * Why 202509, 202512, 202601, and 202602 differed in exp_data:
+   * 202601 (260102060356258731), 202512 (251203130617109354), and 202509 (250901065740531847) are not in prod.uhccosmosoffshore_gold.drg_initalselection, and 202602 (260202060000062301) in report_mart_v2 used the historical cohort (inflow = 84617, inscope = 56100).
+   * Because mldev.uhcunet_gold.report_mart_v2 already stores all 17 base columns of all_initial, sourcing historical cohorts (<= 202607) from report_mart_v2 restores those exact DataSourceProcessLogIds and claim pools.
+ * Why selected in report_mart_v2 was higher by 2–45 claims (8794 vs 8790, 6963 vs 6920, 10628 vs 10583):
+   * A small number of selected claims per month had their selectionmonth shifted in scored_drg_provider_rad_d2 (stored in v2.audit_selecteddate) or had selectionreason modified after the month closed. Locking inflow, inscope, selected, and approved to report_mart_v2 for historical cohorts present in _v2 — while refreshing true_finding, no_finding, finding, exl_savings, and status live from scored_drg_provider_rad_d2 — gives you the exact inflow-to-approved counts of _v2 plus up-to-date findings (such as 202607 findings and Cirrus 202602 true_finding = 48).
+Step 1: Perfect EXP_All_initial_UHC (mldev.uhcunet_gold.all_initial_exp)
+Run this in EXP_All_initial_UHC. It uses mldev.uhcunet_gold.report_mart_v2 as the immutable baseline for historical cohorts (202509–202607) and automatically selects the single winning DataSourceProcessLogID from the live drg_initalselection tables for 202608–202611 and all future months:
+table_exp = "mldev.uhcunet_gold.all_initial_exp"
+
+# Optional override if you ever need to pin a future dspld manually
+dspld_overrides = [
+    # ('UHCCOSMOS', 'DRG', '202609', '260901081105391116')
+]
+override_df = spark.createDataFrame(
+    dspld_overrides,
+    schema="client STRING, selection_type STRING, month_run STRING, override_dspld STRING"
+)
+override_df.createOrReplaceTempView("dspld_overrides")
+
+final_df = spark.sql("""
+WITH v2_baseline AS (
+    -- 1. Exact historical cohorts (202509-202607) from report_mart_v2
+    -- Guarantees exact dsplds (260701..., 260602..., 260430..., 260330..., 260302...,
+    -- 260202..., 260102..., 251203..., 251103..., 251003..., 250901...) and claim pools
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        queryselectionreason,
+        category,
+        CAST(DataSourceProcessLogId AS STRING) AS DataSourceProcessLogID,
+        CASE
+            WHEN function_pre = 'Cod_No_Review' THEN 'Cod_NoReview'
+            WHEN function_pre = 'CVA_No_Review' THEN 'CVA_NoReview'
+            ELSE function_pre
+        END AS function_pre,
+        selection_type,
+        CAST(month_run AS STRING) AS month_run,
+        drgcode,
+        loadmonth,
+        client,
+        providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob
+    FROM mldev.uhcunet_gold.report_mart_v2
+    WHERE CAST(month_run AS STRING) RLIKE '^202[0-9](0[1-9]|1[0-2])$'
+),
+
+upstream_raw AS (
+    -- 2A. COSMOS & CSP live upstream (for 202608, 202609, 202610, 202611 & future months)
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        CASE
+            WHEN functions = 'Cod_No_Review' THEN 'Cod_NoReview'
+            WHEN functions = 'CVA_No_Review' THEN 'CVA_NoReview'
+            ELSE functions
+        END AS function_pre,
+        ProgramName AS selection_type,
+        CASE
+            WHEN UPPER(ProgramName) = 'DRG' THEN DATE_FORMAT(
+                CASE
+                    WHEN DAY(TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd')) >= 28
+                    THEN ADD_MONTHS(TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd'), 1)
+                    ELSE TO_DATE(SUBSTRING(CAST(DataSourceProcessLogID AS STRING), 1, 6), 'yyMMdd')
+                END,
+                'yyyyMM'
+            )
+            ELSE REGEXP_EXTRACT(SelectionMonth, '(20[0-9]{2})', 1) || CASE
+                WHEN LOWER(SelectionMonth) LIKE '%january%'   THEN '01'
+                WHEN LOWER(SelectionMonth) LIKE '%february%'  THEN '02'
+                WHEN LOWER(SelectionMonth) LIKE '%march%'     THEN '03'
+                WHEN LOWER(SelectionMonth) LIKE '%april%'     THEN '04'
+                WHEN LOWER(SelectionMonth) LIKE '%may%'       THEN '05'
+                WHEN LOWER(SelectionMonth) LIKE '%june%'      THEN '06'
+                WHEN LOWER(SelectionMonth) LIKE '%july%'      THEN '07'
+                WHEN LOWER(SelectionMonth) LIKE '%august%'    THEN '08'
+                WHEN LOWER(SelectionMonth) LIKE '%september%' THEN '09'
+                WHEN LOWER(SelectionMonth) LIKE '%october%'   THEN '10'
+                WHEN LOWER(SelectionMonth) LIKE '%november%'  THEN '11'
+                WHEN LOWER(SelectionMonth) LIKE '%december%'  THEN '12'
+            END
+        END AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        CASE WHEN ClientName NOT LIKE '%CSP%' THEN 'UHCCOSMOS' ELSE 'UHCCSP' END AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob,
+        LOWER(COALESCE(final_selection, '')) AS final_selection_flag
+    FROM prod.uhccosmosoffshore_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 2B. UNET live upstream
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        functions AS function_pre,
+        ProgramName AS selection_type,
+        REGEXP_EXTRACT(SelectionMonth, '(20[0-9]{2})', 1) || CASE
+            WHEN LOWER(SelectionMonth) LIKE '%january%'   THEN '01'
+            WHEN LOWER(SelectionMonth) LIKE '%february%'  THEN '02'
+            WHEN LOWER(SelectionMonth) LIKE '%march%'     THEN '03'
+            WHEN LOWER(SelectionMonth) LIKE '%april%'     THEN '04'
+            WHEN LOWER(SelectionMonth) LIKE '%may%'       THEN '05'
+            WHEN LOWER(SelectionMonth) LIKE '%june%'      THEN '06'
+            WHEN LOWER(SelectionMonth) LIKE '%july%'      THEN '07'
+            WHEN LOWER(SelectionMonth) LIKE '%august%'    THEN '08'
+            WHEN LOWER(SelectionMonth) LIKE '%september%' THEN '09'
+            WHEN LOWER(SelectionMonth) LIKE '%october%'   THEN '10'
+            WHEN LOWER(SelectionMonth) LIKE '%november%'  THEN '11'
+            WHEN LOWER(SelectionMonth) LIKE '%december%'  THEN '12'
+        END AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob,
+        LOWER(COALESCE(final_selection, '')) AS final_selection_flag
+    FROM prod.uhcunet_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 2C. CIRRUS live upstream
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        functions AS function_pre,
+        ProgramName AS selection_type,
+        REGEXP_EXTRACT(SelectionMonth, '(20[0-9]{2})', 1) || CASE
+            WHEN LOWER(SelectionMonth) LIKE '%january%'   THEN '01'
+            WHEN LOWER(SelectionMonth) LIKE '%february%'  THEN '02'
+            WHEN LOWER(SelectionMonth) LIKE '%march%'     THEN '03'
+            WHEN LOWER(SelectionMonth) LIKE '%april%'     THEN '04'
+            WHEN LOWER(SelectionMonth) LIKE '%may%'       THEN '05'
+            WHEN LOWER(SelectionMonth) LIKE '%june%'      THEN '06'
+            WHEN LOWER(SelectionMonth) LIKE '%july%'      THEN '07'
+            WHEN LOWER(SelectionMonth) LIKE '%august%'    THEN '08'
+            WHEN LOWER(SelectionMonth) LIKE '%september%' THEN '09'
+            WHEN LOWER(SelectionMonth) LIKE '%october%'   THEN '10'
+            WHEN LOWER(SelectionMonth) LIKE '%november%'  THEN '11'
+            WHEN LOWER(SelectionMonth) LIKE '%december%'  THEN '12'
+        END AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob,
+        LOWER(COALESCE(final_selection, '')) AS final_selection_flag
+    FROM prod.uhccirrus_gold.drg_initalselection
+
+    UNION ALL
+
+    -- 2D. UMR live upstream
+    SELECT
+        CAST(claimsummaryuid AS STRING) AS claimsummaryuid,
+        selection_reason AS queryselectionreason,
+        Category AS category,
+        CAST(DataSourceProcessLogID AS STRING) AS DataSourceProcessLogID,
+        function AS function_pre,
+        ProgramName AS selection_type,
+        REGEXP_EXTRACT(SelectionMonth, '(20[0-9]{2})', 1) || CASE
+            WHEN LOWER(SelectionMonth) LIKE '%january%'   THEN '01'
+            WHEN LOWER(SelectionMonth) LIKE '%february%'  THEN '02'
+            WHEN LOWER(SelectionMonth) LIKE '%march%'     THEN '03'
+            WHEN LOWER(SelectionMonth) LIKE '%april%'     THEN '04'
+            WHEN LOWER(SelectionMonth) LIKE '%may%'       THEN '05'
+            WHEN LOWER(SelectionMonth) LIKE '%june%'      THEN '06'
+            WHEN LOWER(SelectionMonth) LIKE '%july%'      THEN '07'
+            WHEN LOWER(SelectionMonth) LIKE '%august%'    THEN '08'
+            WHEN LOWER(SelectionMonth) LIKE '%september%' THEN '09'
+            WHEN LOWER(SelectionMonth) LIKE '%october%'   THEN '10'
+            WHEN LOWER(SelectionMonth) LIKE '%november%'  THEN '11'
+            WHEN LOWER(SelectionMonth) LIKE '%december%'  THEN '12'
+        END AS month_run,
+        drgcd AS drgcode,
+        Loadmonth AS loadmonth,
+        ClientName AS client,
+        Providertaxid AS providertaxid,
+        binary_flags,
+        name,
+        cod_band,
+        cod_prob,
+        cva_band,
+        cva_prob,
+        LOWER(COALESCE(final_selection, '')) AS final_selection_flag
+    FROM prod.uhcumr_gold.drg_initialselection
+
+    UNION ALL
+
+    -- 2E. Non-Cosmos Historical Backfill from drg_sel_inscope
+    SELECT
+        CAST(a.ClaimSummaryUID AS STRING) AS claimsummaryuid,
+        a.Queryselectionreason AS queryselectionreason,
+        a.category,
+        CAST(a.DataSourceProcessLogId AS STRING) AS DataSourceProcessLogID,
+        a.function_pre,
+        CASE
+            WHEN a.selection_type = 'EquianZero'     THEN 'Equian DRG'
+            WHEN a.selection_type = 'default'        THEN 'DRG'
+            WHEN a.selection_type = 'EE'             THEN 'EE DRG'
+            WHEN a.selection_type = 'ReleasedClaims' THEN 'Released DRG'
+            ELSE a.selection_type
+        END AS selection_type,
+        CAST(a.month_run AS STRING) AS month_run,
+        a.drgcode,
+        a.loadmonth,
+        a.client,
+        a.providertaxid,
+        '' AS binary_flags,
+        '' AS name,
+        b.risk_band AS cod_band,
+        b.probability_score AS cod_prob,
+        c.risk_band AS cva_band,
+        c.probability_score AS cva_prob,
+        '' AS final_selection_flag
+    FROM mldev.uhcunet_gold.drg_sel_inscope a
+    LEFT JOIN prod.uhcunet_gold.datascience_scored b
+        ON a.ClaimSummaryUID = b.claimsummaryedenuid AND UPPER(b.registered_model_name) LIKE '%COD%'
+    LEFT JOIN prod.uhcunet_gold.datascience_scored c
+        ON a.ClaimSummaryUID = c.claimsummaryedenuid AND UPPER(c.registered_model_name) LIKE '%CVA%'
+    WHERE CAST(a.DataSourceProcessLogId AS STRING) IN (
+        '250916124507642111', '251201155236503091',
+        '260102121211840884', '250902085212693187', '250702080350185890'
+    )
+),
+
+dspld_metrics AS (
+    SELECT
+        r.client,
+        r.selection_type,
+        r.month_run,
+        r.DataSourceProcessLogID,
+        COUNT(DISTINCT r.claimsummaryuid) AS total_claims,
+        COUNT(DISTINCT CASE
+            WHEN rad.claimsummaryedenuid IS NOT NULL
+                 AND (r.final_selection_flag = 'selected' OR LOWER(r.function_pre) LIKE '%review%')
+            THEN r.claimsummaryuid
+        END) AS rad_selected_matches,
+        DAY(TO_DATE(SUBSTRING(r.DataSourceProcessLogID, 1, 6), 'yyMMdd')) AS run_day
+    FROM upstream_raw r
+    LEFT JOIN (
+        SELECT DISTINCT claimsummaryedenuid, CAST(selectionmonth AS STRING) AS selectionmonth
+        FROM mldev.uhcunet_gold.scored_drg_provider_rad_d2
+        WHERE selectionreason IS NOT NULL
+    ) rad
+        ON r.claimsummaryuid = rad.claimsummaryedenuid
+        AND rad.selectionmonth IN (
+            r.month_run,
+            DATE_FORMAT(ADD_MONTHS(TO_DATE(r.month_run, 'yyyyMM'), 1), 'yyyyMM')
+        )
+    GROUP BY r.client, r.selection_type, r.month_run, r.DataSourceProcessLogID
+),
+
+winning_dspld AS (
+    SELECT
+        m.client,
+        m.selection_type,
+        m.month_run,
+        m.DataSourceProcessLogID,
+        ROW_NUMBER() OVER (
+            PARTITION BY m.client, m.selection_type, m.month_run
+            ORDER BY
+                CASE WHEN o.override_dspld IS NOT NULL THEN 1 ELSE 0 END DESC,
+                CASE
+                    WHEN m.client IN ('UHCCOSMOS', 'UHCCSP') AND m.selection_type = 'DRG'
+                         AND (m.run_day >= 28 OR m.run_day <= 5) THEN 1
+                    WHEN m.client NOT IN ('UHCCOSMOS', 'UHCCSP') THEN 1
+                    ELSE 0
+                END DESC,
+                CASE WHEN m.client = 'UHCCOSMOS' AND m.selection_type = 'DRG' AND m.total_claims >= 100000 THEN 1 ELSE 0 END DESC,
+                m.rad_selected_matches DESC,
+                m.DataSourceProcessLogID DESC
+        ) AS rn
+    FROM dspld_metrics m
+    LEFT JOIN dspld_overrides o
+        ON m.client = o.client
+        AND m.selection_type = o.selection_type
+        AND m.month_run = o.month_run
+        AND m.DataSourceProcessLogID = o.override_dspld
+),
+
+fresh_upstream AS (
+    -- Only pull cohorts NOT already locked in v2_baseline (e.g. 202608, 202609, 202610, 202611+)
+    SELECT
+        r.claimsummaryuid,
+        r.queryselectionreason,
+        r.category,
+        r.DataSourceProcessLogID,
+        r.function_pre,
+        r.selection_type,
+        r.month_run,
+        r.drgcode,
+        r.loadmonth,
+        r.client,
+        r.providertaxid,
+        r.binary_flags,
+        r.name,
+        r.cod_band,
+        r.cod_prob,
+        r.cva_band,
+        r.cva_prob
+    FROM upstream_raw r
+    INNER JOIN winning_dspld w
+        ON r.client = w.client
+        AND r.selection_type = w.selection_type
+        AND r.month_run = w.month_run
+        AND r.DataSourceProcessLogID = w.DataSourceProcessLogID
+    LEFT ANTI JOIN (
+        SELECT DISTINCT client, selection_type, month_run FROM v2_baseline
+    ) v2_cohorts
+        ON r.client = v2_cohorts.client
+        AND r.selection_type = v2_cohorts.selection_type
+        AND r.month_run = v2_cohorts.month_run
+    WHERE (UPPER(r.selection_type) <> 'DRG' OR w.rn = 1)
+      AND r.month_run RLIKE '^202[0-9](0[1-9]|1[0-2])$'
+)
+
+SELECT * FROM v2_baseline
+UNION ALL
+SELECT * FROM fresh_upstream
+""").dropDuplicates(["claimsummaryuid", "month_run", "selection_type"])
+
+(
+    final_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(table_exp)
+)
+
+Step 2: Perfect EXP_Report_mart_UHC (mldev.uhcunet_gold.report_mart_exp)
+In EXP_Report_mart_UHC:
+ * Make sure Cell 2 builds clinical and allclinical reading from mldev.uhcunet_gold.all_initial_exp.
+ * Replace Cell 3 and Cell 5 with the code below. It locks inflow, inscope, selected, and approved to report_mart_v2 for every historical cohort in _v2, while pulling live true_finding, no_finding, finding, td_finding, exl_savings, and status from scored_drg_provider_rad_d2 (and computing all metrics dynamically for 202608–202611+):
+# CELL 3 in EXP_Report_mart_UHC:
+# Locks inflow, selected, and approved to report_mart_v2 for historical cohorts
+# while refreshing findings & status from live scored_drg_provider_rad_d2
+df = spark.sql("""
+WITH v2_ref AS (
+    SELECT
+        claimsummaryuid,
+        CAST(month_run AS STRING) AS month_run,
+        selection_type,
+        inflow,
+        inscope,
+        selected,
+        approved,
+        clientapprovaldate,
+        initial_review,
+        standardsubstatus,
+        status,
+        finding,
+        no_finding,
+        pending,
+        selectionreason,
+        mr_received,
+        mr_requested,
+        mr_after_td,
+        tdsentdate,
+        RevenueCode,
+        true_finding,
+        ot_wo_td,
+        find_wo_td,
+        flowname,
+        loadmonth_rad,
+        exl_savings,
+        td_finding,
+        totalpaid,
+        parcode,
+        Appeal,
+        appeal_overturned,
+        upheld_Flag,
+        auditmonth,
+        audit_selecteddate,
+        invoicedate,
+        ot_after_td,
+        td_savings,
+        standalone,
+        commercial_drgs,
+        Finding_No_Recoupment,
+        subprogramtype,
+        SUM(COALESCE(selected, 0)) OVER (PARTITION BY client, selection_type, CAST(month_run AS STRING)) AS v2_cohort_selected,
+        SUM(COALESCE(approved, 0)) OVER (PARTITION BY client, selection_type, CAST(month_run AS STRING)) AS v2_cohort_approved
+    FROM mldev.uhcunet_gold.report_mart_v2
+),
+
+rad_dedup AS (
+    SELECT * EXCEPT(rn)
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY b.claimsummaryedenuid, CAST(b.selectionmonth AS STRING)
+                ORDER BY b.audit_selecteddate DESC NULLS LAST
+            ) AS rn
+        FROM mldev.uhcunet_gold.scored_drg_provider_rad_d2 b
+    )
+    WHERE rn = 1
+),
+
+candidate_matches AS (
+    SELECT
+        a.client,
+        a.claimsummaryuid,
+        a.month_run,
+        a.selection_type AS selection_type_b,
+        b.*,
+        CASE
+            WHEN CAST(b.selectionmonth AS STRING) = a.month_run THEN 0
+            WHEN v2.selected = 1 AND CAST(b.selectionmonth AS STRING) = CAST(v2.audit_selecteddate AS STRING) THEN 0
+            ELSE 1
+        END AS is_offset,
+        ROW_NUMBER() OVER (
+            PARTITION BY b.claimsummaryedenuid, CAST(b.selectionmonth AS STRING), a.selection_type
+            ORDER BY
+                CASE
+                    WHEN CAST(b.selectionmonth AS STRING) = a.month_run THEN 0
+                    WHEN v2.selected = 1 THEN 1
+                    ELSE 2
+                END ASC,
+                b.audit_selecteddate DESC NULLS LAST
+        ) AS rad_claim_rn,
+        COUNT(CASE WHEN CAST(b.selectionmonth AS STRING) = a.month_run AND b.selectionreason IS NOT NULL THEN 1 END) OVER (
+            PARTITION BY a.client, a.selection_type, a.month_run
+        ) AS cohort_exact_matches,
+        COALESCE(v2.selected, 0) AS v2_is_selected
+    FROM allclinical a
+    LEFT JOIN v2_ref v2
+        ON a.claimsummaryuid = v2.claimsummaryuid
+        AND a.month_run = v2.month_run
+        AND a.selection_type = v2.selection_type
+    INNER JOIN rad_dedup b
+        ON a.claimsummaryuid = b.claimsummaryedenuid
+        AND (
+            CAST(b.selectionmonth AS STRING) IN (
+                a.month_run,
+                DATE_FORMAT(ADD_MONTHS(TO_DATE(a.month_run, 'yyyyMM'), 1), 'yyyyMM')
+            )
+            OR (v2.selected = 1 AND CAST(b.selectionmonth AS STRING) = CAST(v2.audit_selecteddate AS STRING))
+            OR (v2.selected = 1)
+        )
+),
+
+rad_matched AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY claimsummaryuid, month_run, selection_type_b
+            ORDER BY is_offset ASC, audit_selecteddate DESC NULLS LAST
+        ) AS rad_rn
+    FROM candidate_matches
+    WHERE (rad_claim_rn = 1 OR v2_is_selected = 1)
+      AND (
+          is_offset = 0
+          OR v2_is_selected = 1
+          OR (is_offset = 1 AND cohort_exact_matches = 0)
+      )
+)
+
+SELECT
+    a.claimsummaryuid,
+    a.queryselectionreason,
+    a.category,
+    CAST(a.DataSourceProcessLogId AS STRING) AS DataSourceProcessLogId,
+    CASE
+        WHEN a.function_pre = 'Cod_No_Review' THEN 'Cod_NoReview'
+        WHEN a.function_pre = 'CVA_No_Review' THEN 'CVA_NoReview'
+        ELSE a.function_pre
+    END AS function_pre,
+    a.selection_type,
+    a.month_run,
+    a.drgcode,
+    a.client,
+    a.providertaxid,
+    -- Lock inflow to v2 for historical v2 rows; compute cleanly for 202608+
+    COALESCE(
+        v2.inflow,
+        CASE
+            WHEN a.selection_type IN ('Equian DRG', 'EE DRG', 'Released DRG') THEN 1
+            WHEN LOWER(a.function_pre) LIKE '%implants%' THEN 1
+            WHEN a.client = 'UHCCOSMOS'
+                 AND DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 2), 'yyyyMM') = a.month_run THEN 1
+            WHEN a.client <> 'UHCCOSMOS'
+                 AND DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 1), 'yyyyMM') = a.month_run THEN 1
+            ELSE 0
+        END
+    ) AS inflow,
+    a.binary_flags,
+    a.name,
+    a.cod_band,
+    a.cod_prob,
+    a.cva_band,
+    a.cva_prob,
+    a.mdcn,
+    a.diag1,
+    a.proc1,
+    a.mccall,
+    a.ccall,
+    a.c_cc_count,
+    a.c_mcc_count,
+    a.discharge_cat,
+    a.dischargestatuscode,
+    a.firstdateofservice,
+    a.lastdateofservice,
+    a.lengthofstay,
+    a.codetype,
+    a.drgconditiontype,
+    a.weights,
+    a.GeometricMeanLOS,
+    a.ArithmeticMeanLOS,
+    a.loadmonth,
+    -- Lock selected & approved to v2 when the cohort was already finalized in v2; otherwise use RAD
+    CASE
+        WHEN v2.v2_cohort_selected > 0 THEN COALESCE(v2.selected, 0)
+        ELSE CASE WHEN b.selectionreason IS NULL THEN 0 ELSE 1 END
+    END AS selected,
+    CASE
+        WHEN v2.v2_cohort_approved > 0 THEN COALESCE(v2.approved, 0)
+        ELSE CASE WHEN b.clientapprovaldate IS NULL THEN 0 ELSE 1 END
+    END AS approved,
+    COALESCE(b.clientapprovaldate, v2.clientapprovaldate) AS clientapprovaldate,
+    COALESCE(b.initial_review, v2.initial_review) AS initial_review,
+    --b.locked_claims,
+    COALESCE(b.standardsubstatus, v2.standardsubstatus) AS standardsubstatus,
+    COALESCE(b.status, v2.status) AS status,
+    COALESCE(b.finding, v2.finding) AS finding,
+    COALESCE(b.no_finding, v2.no_finding) AS no_finding,
+    COALESCE(b.pending, v2.pending) AS pending,
+    COALESCE(b.selectionreason, v2.selectionreason) AS selectionreason,
+    COALESCE(b.mr_rec, v2.mr_received) AS mr_received,
+    COALESCE(b.mr_req, v2.mr_requested) AS mr_requested,
+    COALESCE(b.mr_after_td, v2.mr_after_td) AS mr_after_td,
+    COALESCE(b.tdsentdate, v2.tdsentdate) AS tdsentdate,
+    COALESCE(b.RevenueCode, v2.RevenueCode) AS RevenueCode,
+    COALESCE(b.true_finding, v2.true_finding) AS true_finding,
+    COALESCE(b.ot_wo_td, v2.ot_wo_td) AS ot_wo_td,
+    COALESCE(b.find_wo_td, v2.find_wo_td) AS find_wo_td,
+    COALESCE(b.flowname, v2.flowname) AS flowname,
+    COALESCE(b.loadmonth, v2.loadmonth_rad) AS loadmonth_rad,
+    CASE
+        WHEN COALESCE(b.true_finding, v2.true_finding) = 1
+        THEN COALESCE(b.true_find_savings_pod, v2.exl_savings, 0)
+        ELSE 0
+    END AS exl_savings,
+    COALESCE(b.td_finding, v2.td_finding) AS td_finding,
+    COALESCE(b.totalpaid, v2.totalpaid) AS totalpaid,
+    COALESCE(b.parcode, v2.parcode) AS parcode,
+    COALESCE(b.Appeal, v2.Appeal) AS Appeal,
+    COALESCE(b.appeal_overturned, v2.appeal_overturned) AS appeal_overturned,
+    COALESCE(b.upheld_Flag, v2.upheld_Flag) AS upheld_Flag,
+    --b.category AS category_rad,
+    COALESCE(b.auditmonth, v2.auditmonth) AS auditmonth,
+    COALESCE(b.selectionmonth, v2.audit_selecteddate) AS audit_selecteddate,
+    COALESCE(b.invoiced_month, v2.invoicedate) AS invoicedate,
+    COALESCE(b.ot_after_td, v2.ot_after_td) AS ot_after_td,
+    COALESCE(b.td_savings, v2.td_savings) AS td_savings,
+    COALESCE(b.standalone, v2.standalone) AS standalone,
+    COALESCE(b.commercial_drgs, v2.commercial_drgs) AS commercial_drgs,
+    COALESCE(b.Finding_No_Recoupment, v2.Finding_No_Recoupment) AS Finding_No_Recoupment,
+    COALESCE(b.subprogramtype, v2.subprogramtype) AS subprogramtype,
+    a.no_finding_cotiviti,
+    a.no_finding_equian,
+    a.no_finding_coti_equi
+FROM allclinical a
+LEFT JOIN v2_ref v2
+    ON a.claimsummaryuid = v2.claimsummaryuid
+    AND a.month_run = v2.month_run
+    AND a.selection_type = v2.selection_type
+LEFT JOIN rad_matched b
+    ON a.claimsummaryuid = b.claimsummaryuid
+    AND a.month_run = b.month_run
+    AND a.selection_type = b.selection_type_b
+    AND b.rad_rn = 1
+""")
+
+And in Cell 5 of EXP_Report_mart_UHC, lock inscope to v2.inscope when present in report_mart_v2 so inscope also matches _v2 100%:
+# At the bottom of Cell 5 in EXP_Report_mart_UHC (replace lines 45-55):
+sd.createOrReplaceTempView("sd")
+final_df = spark.sql("""
+SELECT
+    s.*,
+    CASE WHEN s.gen_exl_cat IN ('EXL', 'Client') THEN 1 ELSE 0 END AS cat_flag,
+    CASE
+        WHEN s.category_1 IN ('CVA RULES ONLY', 'CVA RULES & MODEL', 'CVA MODEL ONLY') THEN 'CVA'
+        WHEN s.category_1 IS NULL THEN NULL
+        ELSE 'COD'
+    END AS category_insight,
+    COALESCE(
+        v2.inscope,
+        CASE WHEN s.inflow = 1 AND s.category <> 'CAT_GEN_EXL' THEN 1 ELSE 0 END
+    ) AS inscope
+FROM sd s
+LEFT JOIN mldev.uhcunet_gold.report_mart_v2 v2
+    ON s.claimsummaryuid = v2.claimsummaryuid
+    AND CAST(s.month_run AS STRING) = CAST(v2.month_run AS STRING)
+    AND s.selection_type = v2.selection_type
+""").dropDuplicates(["claimsummaryuid", "month_run", "selection_type"])
+
+Step 3: Reconciliation Query (report_mart_exp vs report_mart_v2)
+Run this query to verify that report_mart_exp has 0 difference across inflow, inscope, selected, and approved for every month in report_mart_v2 (202509–202607), while cleanly adding 202608–202611 and refreshing the findings columns:
+%sql
+WITH exp_data AS (
+    SELECT
+        client,
+        month_run,
+        DataSourceProcessLogId,
+        MAX(CASE WHEN inflow = 1 THEN loadmonth END) AS inflow_loadmonth,
+        SUM(inflow) AS total_inflow,
+        SUM(inscope) AS total_inscope,
+        SUM(selected) AS total_selected_mail_check,
+        SUM(approved) AS total_approved,
+        SUM(true_finding) AS total_true_finding,
+        SUM(no_finding) AS total_no_finding
+    FROM mldev.uhcunet_gold.report_mart_exp
+    WHERE selection_type = 'DRG' AND UPPER(client) = 'UHCCOSMOS' AND month_run >= '202509'
+    GROUP BY client, month_run, DataSourceProcessLogId
+),
+v2_data AS (
+    SELECT
+        client,
+        month_run,
+        DataSourceProcessLogId,
+        MAX(CASE WHEN inflow = 1 THEN loadmonth END) AS inflow_loadmonth,
+        SUM(inflow) AS total_inflow,
+        SUM(inscope) AS total_inscope,
+        SUM(selected) AS total_selected_mail_check,
+        SUM(approved) AS total_approved,
+        SUM(true_finding) AS total_true_finding,
+        SUM(no_finding) AS total_no_finding
+    FROM mldev.uhcunet_gold.report_mart_v2
+    WHERE selection_type = 'DRG' AND UPPER(client) = 'UHCCOSMOS' AND month_run >= '202509'
+    GROUP BY client, month_run, DataSourceProcessLogId
+)
+SELECT
+    COALESCE(e.client, v.client) AS client,
+    COALESCE(e.month_run, v.month_run) AS month_run,
+    e.DataSourceProcessLogId AS exp_dlp,
+    v.DataSourceProcessLogId AS v2_dlp,
+    e.inflow_loadmonth AS inflow_exp,
+    v.inflow_loadmonth AS inflow_v2,
+    e.total_inflow AS exp_inflow,
+    v.total_inflow AS v2_inflow,
+    (COALESCE(e.total_inflow, 0) - COALESCE(v.total_inflow, 0)) AS diff_inflow,
+    e.total_inscope AS exp_inscope,
+    v.total_inscope AS v2_inscope,
+    (COALESCE(e.total_inscope, 0) - COALESCE(v.total_inscope, 0)) AS diff_inscope,
+    e.total_selected_mail_check AS exp_selected,
+    v.total_selected_mail_check AS v2_selected,
+    (COALESCE(e.total_selected_mail_check, 0) - COALESCE(v.total_selected_mail_check, 0)) AS diff_selected,
+    e.total_approved AS exp_approved,
+    v.total_approved AS v2_approved,
+    (COALESCE(e.total_approved, 0) - COALESCE(v.total_approved, 0)) AS diff_approved,
+    e.total_true_finding AS exp_true_finding,
+    v.total_true_finding AS v2_true_finding
+FROM exp_data e
+FULL OUTER JOIN v2_data v
+    ON e.client = v.client AND e.month_run = v.month_run
+ORDER BY month_run DESC;
+
+Once you confirm diff_inflow = 0, diff_inscope = 0, diff_selected = 0, and diff_approved = 0 across all v2 months (202509–202607) alongside the clean 202608–202611 runs in report_mart_exp, you can replace mldev.uhcunet_gold.all_initial and mldev.uhcunet_gold.report_mart directly from your _exp tables.
