@@ -1,15 +1,157 @@
-AETNA HRP Insights
- * Primary Driver — Historical Backlog Freeze: Accounting for 66.8% of the overall dip, historical claim selections collapsed by 70% (down to 371 selected from an average of 1,233). This was purely a processing bottleneck rather than a lack of inventory.
-   * Key Pocket Losses: The steepest historical declines occurred in CVA Rules Only / CVA (-217 claims), COD Rules Only / Coding (-214 claims), and COD Model Only / cod_noreview (-108 claims).
- * Secondary Driver — Monthly Selection Rate Drop: Responsible for 33.2% of the dip, the monthly selection rate dropped to a window-low of 10.1% despite strong inscope volume (31,263 claims).
-   * Key Pocket Losses: Major hits came from CVA Rules Only / cva_noreview falling by -286 claims and a total shutdown of cva_review2 (-114 claims combined).
- * Band Breakdown: Losses were heavily concentrated in Grey & Amber COD bands (69% of dip) and Red & Amber CVA bands (74% of dip).
-AETNA ACAS Insights
- * Primary Driver — Historical Selection Breakdown: Driving 86.1% of the overall dip, historical selections plunged 62% (down to 67 selected from an average of 176).
-   * Key Pocket Losses: The drop was almost entirely within Coding, led by COD Rules Only / Coding (-56 claims; 43.9% dip share) and Model Prioritized / Coding (-19 claims; 14.7% dip share).
- * Functional Impact — Coding Dominance: The Coding function accounted for 96.3% of the total dip (-122 claims), pushing selection rates down to 8.9% even with record-high inscope volume (5,828 claims).
- * Minor Driver — Monthly Re-Routing: Monthly volume had a minimal impact (14.2% of dip / -18 claims). A drop in CVA Rules & Model / cva_noreview (-49 claims) was mostly offset by gains in cod_noreview (+39 claims), showing function re-routing rather than true volume loss.
- * Band Breakdown: Primary segment drivers were Red CVA (71.1% of dip) and Amber COD (58.4% of dip).
+df = spark.sql("""
+WITH rad_dedup AS (
+    -- 1. Deduplicate RAD per (claimsummaryedenuid, selectionmonth)
+    SELECT * EXCEPT(rn)
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY b.claimsummaryedenuid, CAST(b.selectionmonth AS STRING)
+                ORDER BY b.audit_selecteddate DESC NULLS LAST
+            ) AS rn
+        FROM mldev.uhcunet_gold.scored_drg_provider_rad_d2 b
+    )
+    WHERE rn = 1
+),
+candidate_matches AS (
+    -- 2. Find exact (offset=0) and +1 month (offset=1) candidate matches across all clients
+    SELECT
+        a.client,
+        a.claimsummaryuid,
+        a.month_run,
+        a.selection_type AS selection_type_b,
+        b.*,
+        CASE WHEN CAST(b.selectionmonth AS STRING) = a.month_run THEN 0 ELSE 1 END AS is_offset,
+        -- Lock each RAD row to its exact month_run first so M+1 rows are never double-counted in M
+        ROW_NUMBER() OVER (
+            PARTITION BY b.claimsummaryedenuid, CAST(b.selectionmonth AS STRING), a.selection_type
+            ORDER BY
+                CASE WHEN CAST(b.selectionmonth AS STRING) = a.month_run THEN 0 ELSE 1 END ASC,
+                b.audit_selecteddate DESC NULLS LAST
+        ) AS rad_claim_rn,
+        -- Count how many exact (offset=0) selected matches exist for this (client, selection_type, month_run)
+        COUNT(CASE WHEN CAST(b.selectionmonth AS STRING) = a.month_run AND b.selectionreason IS NOT NULL THEN 1 END) OVER (
+            PARTITION BY a.client, a.selection_type, a.month_run
+        ) AS cohort_exact_matches
+    FROM allclinical a
+    INNER JOIN rad_dedup b
+        ON a.claimsummaryuid = b.claimsummaryedenuid
+        AND CAST(b.selectionmonth AS STRING) IN (
+            a.month_run,
+            DATE_FORMAT(ADD_MONTHS(TO_DATE(a.month_run, 'yyyyMM'), 1), 'yyyyMM')
+        )
+),
+rad_matched AS (
+    -- 3. Keep exact matches for normal months; auto-fallback to +1 month ONLY when an entire cohort was shifted in RAD
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY claimsummaryuid, month_run, selection_type_b
+            ORDER BY is_offset ASC, audit_selecteddate DESC NULLS LAST
+        ) AS rad_rn
+    FROM candidate_matches
+    WHERE rad_claim_rn = 1
+      AND (
+          is_offset = 0
+          OR (is_offset = 1 AND cohort_exact_matches = 0)
+      )
+)
+SELECT
+    a.claimsummaryuid,
+    a.queryselectionreason,
+    a.category,
+    CAST(a.DataSourceProcessLogId AS STRING) AS DataSourceProcessLogId,
+    CASE
+        WHEN a.function_pre = 'Cod_No_Review' THEN 'Cod_NoReview'
+        WHEN a.function_pre = 'CVA_No_Review' THEN 'CVA_NoReview'
+        ELSE a.function_pre
+    END AS function_pre,
+    a.selection_type,
+    a.month_run,
+    a.drgcode,
+    a.client,
+    a.providertaxid,
+    CASE
+        WHEN a.selection_type IN ('Equian DRG', 'EE DRG', 'Released DRG') THEN 1
+        WHEN LOWER(a.function_pre) LIKE '%implants%' THEN 1
+        WHEN a.client = 'UHCCOSMOS'
+             AND DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 2), 'yyyyMM') = a.month_run THEN 1
+        WHEN DATE_FORMAT(ADD_MONTHS(TO_DATE(CAST(a.loadmonth AS STRING), 'yyyyMM'), 1), 'yyyyMM') = a.month_run THEN 1
+        ELSE 0
+    END AS inflow,
+    a.binary_flags,
+    a.name,
+    a.cod_band,
+    a.cod_prob,
+    a.cva_band,
+    a.cva_prob,
+    a.mdcn,
+    a.diag1,
+    a.proc1,
+    a.mccall,
+    a.ccall,
+    a.c_cc_count,
+    a.c_mcc_count,
+    a.discharge_cat,
+    a.dischargestatuscode,
+    a.firstdateofservice,
+    a.lastdateofservice,
+    a.lengthofstay,
+    a.codetype,
+    a.drgconditiontype,
+    a.weights,
+    a.GeometricMeanLOS,
+    a.ArithmeticMeanLOS,
+    a.loadmonth,
+    CASE WHEN b.selectionreason IS NULL THEN 0 ELSE 1 END AS selected,
+    CASE WHEN b.clientapprovaldate IS NULL THEN 0 ELSE 1 END AS approved,
+    b.clientapprovaldate,
+    b.initial_review,
+    --b.locked_claims,
+    b.standardsubstatus,
+    b.status,
+    b.finding,
+    b.no_finding,
+    b.pending,
+    b.selectionreason,
+    b.mr_rec AS mr_received,
+    b.mr_req AS mr_requested,
+    b.mr_after_td,
+    b.tdsentdate,
+    b.RevenueCode,
+    b.true_finding,
+    b.ot_wo_td,
+    b.find_wo_td,
+    b.flowname,
+    b.loadmonth AS loadmonth_rad,
+    CASE WHEN b.true_finding = 1 THEN b.true_find_savings_pod ELSE 0 END AS exl_savings,
+    b.td_finding,
+    b.totalpaid,
+    b.parcode,
+    b.Appeal,
+    b.appeal_overturned,
+    b.upheld_Flag,
+    b.category AS category_rad,
+    b.auditmonth,
+    b.selectionmonth AS audit_selecteddate,
+    b.invoiced_month AS invoicedate,
+    b.ot_after_td,
+    b.td_savings,
+    b.standalone,
+    b.commercial_drgs,
+    b.Finding_No_Recoupment,
+    b.subprogramtype,
+    a.no_finding_cotiviti,
+    a.no_finding_equian,
+    a.no_finding_coti_equi
+FROM allclinical a
+LEFT JOIN rad_matched b
+    ON a.claimsummaryuid = b.claimsummaryuid
+    AND a.month_run = b.month_run
+    AND a.selection_type = b.selection_type_b
+    AND b.rad_rn = 1
+""")
+
 
 
 
